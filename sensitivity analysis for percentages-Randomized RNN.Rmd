@@ -1,7 +1,6 @@
 ---
 title: "sensitivity analysis for percentages-Randomized RNN"
 author: "Joshua Lu"
-date: "2025-10-18"
 output: html_document
 ---
 
@@ -240,3 +239,4 @@ fine_det_df <- data.frame(
   row.names = NULL
 )
 ```
+
