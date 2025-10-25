@@ -1,7 +1,6 @@
 ---
 title: "iforest"
 output: html_document
-date: "2025-08-31"
 ---
 
 Define the coarse-grained model function: 
@@ -531,4 +530,5 @@ ggplot(df_all, aes(x = index, y = row, color = label)) +
         )
 
 ```
+
 
