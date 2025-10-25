@@ -1,7 +1,6 @@
 ---
 title: "Randomized RNN"
 output: html_document
-date: "2025-09-02"
 ---
 
 Define the coarse-grained model function: 
@@ -512,3 +511,4 @@ plot(time_idx, result, type = "l", lwd = 1.3,
 if (length(detected_all)) points(detected_all, result[detected_all], pch = 19, cex = 0.9, col = "blue")
 if (length(missed_true)) points(missed_true, result[missed_true], pch = 19, cex = 0.9, col = "red")
 ```
+
