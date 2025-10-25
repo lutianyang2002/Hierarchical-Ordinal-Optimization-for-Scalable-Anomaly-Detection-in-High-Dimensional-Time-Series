@@ -1,0 +1,571 @@
+---
+title: "DBSCAN"
+output: html_document
+date: "2025-08-31"
+---
+
+Define the coarse-grained model function: 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(isotree)
+
+data_raw <- read.csv("C:/Users/User/Desktop/water.csv")
+non_na_mask <- complete.cases(data_raw)
+data <- data_raw[non_na_mask, ]
+event_flag <- data$EVENT
+anomalies <- which(event_flag == TRUE)
+data_no_time <- data[, !(names(data) %in% c("Time", "EVENT"))]
+
+# Coarse-grained model function
+rsc_coarse <- function(data, n_trials = 100, subspace_dim = 5, eps = 0.3, minPts = 4,
+                   trial_top_percent = 0.10, final_top_percent = 0.20, verbose = FALSE) {
+  n <- nrow(data)
+  p <- ncol(data)
+  vote_counts <- rep(0, n)
+  data <- scale(data)
+
+  for (t in 1:n_trials) {
+    selected_features <- sample(1:p, subspace_dim)
+    data_sub <- data[, selected_features, drop = FALSE]
+    set.seed(t)
+    dbscan_result <- tryCatch({
+      dbscan::dbscan(data_sub, eps = eps, minPts = minPts)
+    }, error = function(e) return(NULL))
+    if (is.null(dbscan_result)) next
+    cluster_labels <- dbscan_result$cluster
+    trial_anomalies <- which(cluster_labels == 0)  # select noise points first
+    noise_count <- length(trial_anomalies)
+    threshold <- ceiling(trial_top_percent * n)
+
+    if (noise_count < threshold) {
+      cluster_sizes <- table(cluster_labels[cluster_labels != 0])
+      sorted_clusters <- names(sort(cluster_sizes, decreasing = FALSE))
+      cumulative <- noise_count
+      for (cl in sorted_clusters) {
+        cl_int <- as.integer(cl)
+        members <- which(cluster_labels == cl_int)
+        trial_anomalies <- c(trial_anomalies, members)
+        cumulative <- cumulative + length(members)
+        if (cumulative >= threshold) break
+      }
+    }
+    vote_counts[trial_anomalies] <- vote_counts[trial_anomalies] + 1
+
+    if (verbose && t %% 10 == 0) {
+      cat("Trial", t, "completed\n")
+    }
+  }
+
+  # detect potential anomalies by voting
+  final_top_k <- round(final_top_percent * n)
+  selected_anomalies <- order(vote_counts, decreasing = TRUE)[1:final_top_k]
+  return(selected_anomalies)
+}
+```
+
+
+Construct coarse-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Coarse-grained model 1
+result1 <- rsc_coarse(
+  data = data_no_time,
+  n_trials = 100,
+  subspace_dim = 5,
+  eps = 0.3,
+  minPts = 4,
+  trial_top_percent = 0.03,
+  final_top_percent = 0.10,
+  verbose = FALSE
+)
+recall1 <- length(intersect(result1, anomalies)) / length(anomalies)
+precision1 <- length(intersect(result1, anomalies)) / length(result1)
+cat("result1 - Recall:", round(recall1, 4), "Precision:", round(precision1, 4), "\n")
+# result1 - Recall: 0.9751 Precision: 0.1215
+
+# Coarse-grained model 2
+result2 <- rsc_coarse(
+  data = data_no_time,
+  n_trials = 100,
+  subspace_dim = 6,
+  eps = 0.4,
+  minPts = 6,
+  trial_top_percent = 0.03,
+  final_top_percent = 0.10,
+  verbose = FALSE
+)
+recall2 <- length(intersect(result2, anomalies)) / length(anomalies)
+precision2 <- length(intersect(result2, anomalies)) / length(result2)
+cat("result2 - Recall:", round(recall2, 4), "Precision:", round(precision2, 4), "\n")
+# result2 - Recall: 0.9728 Precision: 0.1212
+
+# Coarse-grained model 3
+result3 <- rsc_coarse(
+  data = data_no_time,
+  n_trials = 100,
+  subspace_dim = 6,
+  eps = 0.45,
+  minPts = 5,
+  trial_top_percent = 0.03,
+  final_top_percent = 0.10,
+  verbose = FALSE
+)
+recall3 <- length(intersect(result3, anomalies)) / length(anomalies)
+precision3 <- length(intersect(result3, anomalies)) / length(result3)
+cat("result3 - Recall:", round(recall3, 4), "Precision:", round(precision3, 4), "\n")
+# result3 - Recall: 0.9502 Precision: 0.1184
+```
+
+
+Define the fine-grained model function:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+rsc_fine <- function(data, subset_index, n_trials = 100, subspace_dim = 5, eps = 0.5,
+                     minPts = 5, trial_top_percent = 0.01, 
+                     final_top_k = 1726, verbose = FALSE) {
+  data <- scale(data)
+  n <- length(subset_index)
+  p <- ncol(data)
+  vote_counts <- rep(0, n)  
+  for (t in 1:n_trials) {
+    selected_features <- sample(1:p, subspace_dim)
+    data_sub <- data[subset_index, selected_features, drop = FALSE]
+    set.seed(t)
+    dbscan_result <- tryCatch({
+      dbscan::dbscan(data_sub, eps = eps, minPts = minPts)
+    }, error = function(e) return(NULL))
+    if (is.null(dbscan_result)) next
+    cluster_labels <- dbscan_result$cluster
+    num_points <- length(cluster_labels)
+    is_noise <- cluster_labels == 0
+    noise_indices <- which(is_noise)
+
+    # If the noise is sufficient, use only the noise
+    if (length(noise_indices) >= trial_top_percent * num_points) {
+      selected_indices <- noise_indices
+    } else {
+      # Otherwise, add small clusters until trial_top_percent is achieved
+      cluster_sizes <- table(cluster_labels[cluster_labels != 0])
+      sorted_clusters <- names(sort(cluster_sizes, decreasing = FALSE))
+      cumulative <- length(noise_indices)
+      selected_clusters <- c()
+      for (cl in sorted_clusters) {
+        cumulative <- cumulative + cluster_sizes[cl]
+        selected_clusters <- c(selected_clusters, cl)
+        if (cumulative >= trial_top_percent * num_points) break
+      }
+      cluster_selected_indices <- which(cluster_labels %in% as.integer(selected_clusters))
+      selected_indices <- union(noise_indices, cluster_selected_indices)
+    }
+    vote_counts[selected_indices] <- vote_counts[selected_indices] + 1
+
+    if (verbose && t %% 10 == 0) {
+      cat("Trial", t, "completed\n")
+    }
+  }
+  top_indices <- order(vote_counts, decreasing = TRUE)[1:final_top_k]
+  return(subset_index[top_indices])
+}
+```
+
+
+Construct fine-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Fine-grained model 1
+fine1_1 <- rsc_fine(
+  data = data_no_time,
+  subset_index = result1,
+  n_trials = 100,
+  subspace_dim = 3,
+  eps = 0.3,
+  minPts = 2,
+  trial_top_percent = 0.05
+)
+recall1_1 <- length(intersect(fine1_1, anomalies)) / length(fine1_1)
+precision1_1 <- recall1_1
+cat("result1_1 - Recall:", round(recall1_1, 4), "Precision:", round(precision1_1, 4), "\n")
+# result1_1 - Recall: 0.6402 Precision: 0.6402
+
+fine2_1 <- rsc_fine(
+  data = data_no_time,
+  subset_index = result2,
+  n_trials = 100,
+  subspace_dim = 3,
+  eps = 0.3,
+  minPts = 2,
+  trial_top_percent = 0.05
+)
+recall2_1 <- length(intersect(fine2_1, anomalies)) / length(fine2_1)
+precision2_1 <- recall2_1
+cat("result2_1 - Recall:", round(recall2_1, 4), "Precision:", round(precision2_1, 4), "\n")
+# result2_1 - Recall: 0.6454 Precision: 0.6454
+
+fine3_1 <- rsc_fine(
+  data = data_no_time,
+  subset_index = result3,
+  n_trials = 100,
+  subspace_dim = 3,
+  eps = 0.3,
+  minPts = 2,
+  trial_top_percent = 0.05
+)
+recall3_1 <- length(intersect(fine3_1, anomalies)) / length(fine3_1)
+precision3_1 <- recall3_1
+cat("result3_1 - Recall:", round(recall3_1, 4), "Precision:", round(precision3_1, 4), "\n")
+# result3_1 - Recall: 0.6234 Precision: 0.6234
+
+# Fine-grained model 2
+fine1_2 <- rsc_fine(
+  data = data_no_time,
+  subset_index = result1,
+  n_trials = 100,
+  subspace_dim = 5,
+  eps = 1,
+  minPts = 3,
+  trial_top_percent = 0.05
+)
+recall1_2 <- length(intersect(fine1_2, anomalies)) / length(fine1_2)
+precision1_2 <- recall1_2
+cat("result1_2 - Recall:", round(recall1_2, 4), "Precision:", round(precision1_2, 4), "\n")
+# result1_2 - Recall: 0.6448 Precision: 0.6448
+
+fine2_2 <- rsc_fine(
+  data = data_no_time,
+  subset_index = result2,
+  n_trials = 100,
+  subspace_dim = 5,
+  eps = 1,
+  minPts = 3,
+  trial_top_percent = 0.05
+)
+recall2_2 <- length(intersect(fine2_2, anomalies)) / length(fine2_2)
+precision2_2 <- recall2_2
+cat("result2_2 - Recall:", round(recall2_2, 4), "Precision:", round(precision2_2, 4), "\n")
+# result2_2 - Recall: 0.6587 Precision: 0.6587
+
+fine3_2 <- rsc_fine(
+  data = data_no_time,
+  subset_index = result3,
+  n_trials = 100,
+  subspace_dim = 5,
+  eps = 1,
+  minPts = 3,
+  trial_top_percent = 0.05
+)
+recall3_2 <- length(intersect(fine3_2, anomalies)) / length(fine3_2)
+precision3_2 <- recall3_2
+cat("result3_2 - Recall:", round(recall3_2, 4), "Precision:", round(precision3_2, 4), "\n")
+# result3_2 - Recall: 0.6327 Precision: 0.6327
+
+# Fine-grained model 3
+fine1_3 <- rsc_fine(
+  data = data_no_time,
+  subset_index = result1,
+  n_trials = 100,
+  subspace_dim = 2,
+  eps = 0.7,
+  minPts = 2,
+  trial_top_percent = 0.05
+)
+recall1_3 <- length(intersect(fine1_3, anomalies)) / length(fine1_3)
+precision1_3 <- recall1_3
+cat("result1_3 - Recall:", round(recall1_3, 4), "Precision:", round(precision1_3, 4), "\n")
+# result1_3 - Recall: 0.5742 Precision: 0.5742
+
+fine2_3 <- rsc_fine(
+  data = data_no_time,
+  subset_index = result2,
+  n_trials = 100,
+  subspace_dim = 2,
+  eps = 0.7,
+  minPts = 2,
+  trial_top_percent = 0.05
+)
+recall2_3 <- length(intersect(fine2_3, anomalies)) / length(fine2_3)
+precision2_3 <- recall2_3
+cat("result2_3 - Recall:", round(recall2_3, 4), "Precision:", round(precision2_3, 4), "\n")
+# result2_3 - Recall: 0.5574 Precision: 0.5574
+
+fine3_3 <- rsc_fine(
+  data = data_no_time,
+  subset_index = result3,
+  n_trials = 100,
+  subspace_dim = 2,
+  eps = 0.7,
+  minPts = 2,
+  trial_top_percent = 0.05
+)
+recall3_3 <- length(intersect(fine3_3, anomalies)) / length(fine3_3)
+precision3_3 <- recall3_3
+cat("result3_3 - Recall:", round(recall3_3, 4), "Precision:", round(precision3_3, 4), "\n")
+# result3_3 - Recall: 0.5765 Precision: 0.5765 
+```
+
+
+Define the function to compute Consistency Probability:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Define the main function
+compute_cp_by_score <- function(score_matrix_A, score_matrix_B) {
+  index_A <- score_matrix_A[1, ]
+  scores_A <- score_matrix_A[2, ]
+  index_B <- score_matrix_B[1, ]
+  scores_B <- score_matrix_B[2, ]
+
+  # Check if indices are identical
+  if (!all(index_A == index_B)) {
+    stop("The first-row indices of the two input matrices are not identical, cannot compare")
+  }
+
+  n <- length(index_A)
+  if (n < 2) stop("Less than 2 points, cannot compute CP value")
+
+  consistent <- 0
+  total_pairs <- 0
+
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      sAi <- scores_A[i]; sAj <- scores_A[j]
+      sBi <- scores_B[i]; sBj <- scores_B[j]
+      if (sAi == 1 && sAj == 1 && sBi == 1 && sBj == 1) {
+        consistent <- consistent + 1
+      } else {
+        sign_A <- sign(sAi - sAj)
+        sign_B <- sign(sBi - sBj)
+        if (sign_A != 0 && sign_B != 0 && sign_A == sign_B) {
+          consistent <- consistent + 1
+        }
+      }
+      total_pairs <- total_pairs + 1
+    }
+  }
+
+  cp <- consistent / total_pairs
+  return(cp * 100)  # percentage
+}
+
+# Compute Anomaly Scores for Coarse-grained Models
+coarse_scoring <- function(data, 
+                           target_indices,
+                           n_trials = 100,
+                           subspace_dim = 5,
+                           eps = 0.3,
+                           minPts = 4,
+                           verbose = FALSE) {
+  data <- scale(data)
+  p <- ncol(data)
+  n <- length(target_indices)
+  cluster_size_matrix <- matrix(0, nrow = n_trials, ncol = n)
+  for (t in 1:n_trials) {
+    set.seed(t)
+    selected_features <- sample(1:p, subspace_dim)
+    data_sub <- data[, selected_features, drop = FALSE]
+    db_result <- tryCatch({
+      dbscan(data_sub, eps = eps, minPts = minPts)
+    }, error = function(e) return(NULL))
+    if (is.null(db_result)) next
+    cluster_labels <- db_result$cluster
+    label_table <- table(cluster_labels)
+    cluster_size_matrix[t, ] <- sapply(target_indices, function(i) {
+      label <- cluster_labels[i]
+      if (label == 0 || is.na(label)) return(1)
+      return(label_table[as.character(label)])
+    })
+    if (verbose && t %% 10 == 0) cat("Trial", t, "completed\n")    
+  }
+  avg_cluster_size <- colMeans(cluster_size_matrix)
+  result_matrix <- rbind(target_indices, avg_cluster_size)
+  return(result_matrix)
+}
+
+# Compute Anomaly Scores for fine-grained Models
+fine_scoring <- function(data, coarse_indices, fine_indices,
+                         n_trials = 100,
+                         subspace_dim = 2,
+                         eps = 0.7,
+                         minPts = 2,
+                         verbose = FALSE) {
+  data <- scale(data)
+  p <- ncol(data)
+  n <- length(fine_indices)
+  cluster_size_matrix <- matrix(0, nrow = n_trials, ncol = n)
+  for (t in 1:n_trials) {
+    set.seed(t)
+    selected_features <- sample(1:p, subspace_dim)
+    data_sub <- data[coarse_indices, selected_features, drop = FALSE]
+    db_result <- tryCatch({
+      dbscan(data_sub, eps = eps, minPts = minPts)
+    }, error = function(e) return(NULL))
+    if (is.null(db_result)) next
+    cluster_labels <- db_result$cluster
+    label_table <- table(cluster_labels)
+    cluster_map <- setNames(cluster_labels, coarse_indices)
+    cluster_size_matrix[t, ] <- sapply(fine_indices, function(i) {
+      label <- cluster_map[as.character(i)]
+      if (is.na(label) || label == 0) return(1)
+      return(label_table[as.character(label)])
+    })
+    if (verbose && t %% 10 == 0) cat("Trial", t, "completed\n")
+  }
+  avg_cluster_size <- colMeans(cluster_size_matrix)
+  result_matrix <- rbind(fine_indices, avg_cluster_size)
+  return(result_matrix)
+}
+```
+
+
+Compute Consistency Probability values:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Coarse model scoring
+r1_fine1_coarse <- coarse_scoring(data_no_time, target_indices = fine1_1,
+                                  n_trials = 100, subspace_dim = 5, eps = 0.3, minPts = 4)
+r1_fine2_coarse <- coarse_scoring(data_no_time, target_indices = fine1_2,
+                                  n_trials = 100, subspace_dim = 5, eps = 0.3, minPts = 4)
+r1_fine3_coarse <- coarse_scoring(data_no_time, target_indices = fine1_3,
+                                  n_trials = 100, subspace_dim = 5, eps = 0.3, minPts = 4)
+
+r2_fine1_coarse <- coarse_scoring(data_no_time, target_indices = fine2_1,
+                                  n_trials = 100, subspace_dim = 6, eps = 0.4, minPts = 6)
+r2_fine2_coarse <- coarse_scoring(data_no_time, target_indices = fine2_2,
+                                  n_trials = 100, subspace_dim = 6, eps = 0.4, minPts = 6)
+r2_fine3_coarse <- coarse_scoring(data_no_time, target_indices = fine2_3,
+                                  n_trials = 100, subspace_dim = 6, eps = 0.4, minPts = 6)
+
+r3_fine1_coarse <- coarse_scoring(data_no_time, target_indices = fine3_1,
+                                  n_trials = 100, subspace_dim = 6, eps = 0.45, minPts = 5)
+r3_fine2_coarse <- coarse_scoring(data_no_time, target_indices = fine3_2,
+                                  n_trials = 100, subspace_dim = 6, eps = 0.45, minPts = 5)
+r3_fine3_coarse <- coarse_scoring(data_no_time, target_indices = fine3_3,
+                                  n_trials = 100, subspace_dim = 6, eps = 0.45, minPts = 5)
+
+# Fine model scoring (using coarse model subset for training)
+r1_fine1_fine <- fine_scoring(data_no_time, coarse_indices = result1, fine_indices = fine1_1,
+                              n_trials = 100, subspace_dim = 3, eps = 0.3, minPts = 2)
+r2_fine1_fine <- fine_scoring(data_no_time, coarse_indices = result2, fine_indices = fine2_1,
+                              n_trials = 100, subspace_dim = 3, eps = 0.3, minPts = 2)
+r3_fine1_fine <- fine_scoring(data_no_time, coarse_indices = result3, fine_indices = fine3_1,
+                              n_trials = 100, subspace_dim = 3, eps = 0.3, minPts = 2)
+
+r1_fine2_fine <- fine_scoring(data_no_time, coarse_indices = result1, fine_indices = fine1_2,
+                              n_trials = 100, subspace_dim = 5, eps = 1, minPts = 3)
+r2_fine2_fine <- fine_scoring(data_no_time, coarse_indices = result2, fine_indices = fine2_2,
+                              n_trials = 100, subspace_dim = 5, eps = 1, minPts = 3)
+r3_fine2_fine <- fine_scoring(data_no_time, coarse_indices = result3, fine_indices = fine3_2,
+                              n_trials = 100, subspace_dim = 5, eps = 1, minPts = 3)
+
+r1_fine3_fine <- fine_scoring(data_no_time, coarse_indices = result1, fine_indices = fine1_3,
+                              n_trials = 100, subspace_dim = 2, eps = 0.7, minPts = 2)
+r2_fine3_fine <- fine_scoring(data_no_time, coarse_indices = result2, fine_indices = fine2_3,
+                              n_trials = 100, subspace_dim = 2, eps = 0.7, minPts = 2)
+r3_fine3_fine <- fine_scoring(data_no_time, coarse_indices = result3, fine_indices = fine3_3,
+                              n_trials = 100, subspace_dim = 2, eps = 0.7, minPts = 2)
+
+# CP value computation
+cp_r1_f1 <- compute_cp_by_score(r1_fine1_coarse, r1_fine1_fine)
+cp_r2_f1 <- compute_cp_by_score(r2_fine1_coarse, r2_fine1_fine)
+cp_r3_f1 <- compute_cp_by_score(r3_fine1_coarse, r3_fine1_fine)
+
+cp_r1_f2 <- compute_cp_by_score(r1_fine2_coarse, r1_fine2_fine)
+cp_r2_f2 <- compute_cp_by_score(r2_fine2_coarse, r2_fine2_fine)
+cp_r3_f2 <- compute_cp_by_score(r3_fine2_coarse, r3_fine2_fine)
+
+cp_r1_f3 <- compute_cp_by_score(r1_fine3_coarse, r1_fine3_fine)
+cp_r2_f3 <- compute_cp_by_score(r2_fine3_coarse, r2_fine3_fine)
+cp_r3_f3 <- compute_cp_by_score(r3_fine3_coarse, r3_fine3_fine)
+
+# Output results
+cat("CP(result1, fine1):", round(cp_r1_f1, 4), "%\n")
+#
+cat("CP(result2, fine1):", round(cp_r2_f1, 4), "%\n")
+#
+cat("CP(result3, fine1):", round(cp_r3_f1, 4), "%\n")
+#
+
+cat("CP(result1, fine2):", round(cp_r1_f2, 4), "%\n")
+#
+cat("CP(result2, fine2):", round(cp_r2_f2, 4), "%\n")
+#
+cat("CP(result3, fine2):", round(cp_r3_f2, 4), "%\n")
+#
+
+cat("CP(result1, fine3):", round(cp_r1_f3, 4), "%\n")
+#
+cat("CP(result2, fine3):", round(cp_r2_f3, 4), "%\n")
+#
+cat("CP(result3, fine3):", round(cp_r3_f3, 4), "%\n")
+#
+```
+
+
+Visualization: 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+
+# Build a general dataframe function
+build_df <- function(result, anomalies, name, row_index) {
+  all_idx <- sort(unique(c(result, anomalies)))
+  data.frame(
+    index = all_idx,
+    method = name,
+    row = row_index,
+    label = ifelse(all_idx %in% anomalies & all_idx %in% result, "Overlap",
+                   ifelse(all_idx %in% anomalies, "Missed", "False Positive"))
+  )
+}
+
+# Build the main dataframe
+df_all <- data.frame(
+  index = anomalies,
+  method = "Ground Truth",
+  row = 1,
+  label = "True Anomaly"
+)
+
+# Add 9 model results, ordered by Result
+df_all <- bind_rows(
+  df_all,
+  build_df(fine1_1, anomalies, "Result1_1", 2),
+  build_df(fine1_2, anomalies, "Result1_2", 3),
+  build_df(fine1_3, anomalies, "Result1_3", 4),
+  
+  build_df(fine2_1, anomalies, "Result2_1", 5),
+  build_df(fine2_2, anomalies, "Result2_2", 6),
+  build_df(fine2_3, anomalies, "Result2_3", 7),
+  
+  build_df(fine3_1, anomalies, "Result3_1", 8),
+  build_df(fine3_2, anomalies, "Result3_2", 9),
+  build_df(fine3_3, anomalies, "Result3_3", 10)
+)
+
+# Set color mapping
+color_map <- c(
+  "True Anomaly" = "black",
+  "Overlap" = "red",
+  "Missed" = "blue",
+  "False Positive" = "orange"
+)
+
+# Set y-axis labels (match new ordering)
+row_labels <- c("Ground Truth",
+                "Result1_Fine1", "Result1_Fine2", "Result1_Fine3",
+                "Result2_Fine1", "Result2_Fine2", "Result2_Fine3",
+                "Result3_Fine1", "Result3_Fine2", "Result3_Fine3")
+
+# Plot
+ggplot(df_all, aes(x = index, y = row, color = label)) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  scale_color_manual(values = color_map) +
+  scale_y_continuous(breaks = 1:10, labels = row_labels, trans = "reverse") +
+  labs(x = "Time Index", y = "Method / Ground Truth", color = "Status") +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 10),
+        legend.position = "bottom",
+        legend.text  = element_text(size = 20),
+        legend.title = element_text(size = 16)
+        )
+```
+
+
+
+
+
+
+

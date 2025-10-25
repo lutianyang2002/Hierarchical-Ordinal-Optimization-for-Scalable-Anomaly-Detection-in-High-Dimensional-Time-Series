@@ -1,0 +1,256 @@
+---
+title: "sensitivity analysis for percentages-iforest"
+author: "Joshua Lu"
+date: "2025-10-19"
+output: html_document
+---
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(isotree)
+
+data_raw <- read.csv("water.csv")
+non_na_mask <- complete.cases(data_raw)
+data <- data_raw[non_na_mask, ]
+event_flag <- data$EVENT
+anomalies <- which(event_flag == TRUE)
+data_no_time <- data[, !(names(data) %in% c("Time", "EVENT"))]
+
+# coarse-grained model function
+coarse_iforest <- function(data, trial_top_percent = 0.05,  
+                                 final_top_percent = 0.10, 
+                                 n_trials = 100,
+                                 ntrees = 100,
+                                 sample_size = 256,
+                                 ndim = 1,
+                                 weight_prob = 0.0) {
+  data <- as.matrix(data)
+  N <- nrow(data)
+  selected_counts <- rep(0, N)
+  
+  for (trial in 1:n_trials) {
+    set.seed(2025 + trial)
+    model <- isolation.forest(data,
+                              ntrees = ntrees,
+                              sample_size = sample_size,
+                              ndim = ndim,
+                              prob_pick_avg_gain = weight_prob)
+    
+    scores <- predict(model, data, type = "score")
+    
+    k <- ceiling(trial_top_percent * N)
+    top_indices <- order(scores, decreasing = TRUE)[1:k]
+    selected_counts[top_indices] <- selected_counts[top_indices] + 1
+  }
+  
+  m <- ceiling(final_top_percent * N)
+  nonzero <- which(selected_counts > 0)
+  
+  if (length(nonzero) == 0) {
+    warning("No points were detected as anomalies in any trial.")
+    return(integer(0))
+  }
+  
+  final_indices <- order(selected_counts[nonzero], decreasing = TRUE)[1:min(m, length(nonzero))]
+  final_indices <- nonzero[final_indices]
+  sort(final_indices)
+}
+
+# fine-grained model function
+fine_iforest <- function(data,
+                         trial_top_percent = 0.15,
+                         n_trials = 300,
+                         ntrees = 100,
+                         sample_size = 256,
+                         ndim = 1,
+                         weight_prob = 0.0,
+                         final_top_k = 1726) {
+  data <- as.matrix(data)
+  N <- nrow(data)
+  selected_counts <- rep(0, N)
+
+  for (trial in 1:n_trials) {
+    set.seed(2025 + trial)
+    model <- isolation.forest(data,
+                              ntrees = ntrees,
+                              sample_size = sample_size,
+                              ndim = ndim,
+                              prob_pick_avg_gain = weight_prob)
+    scores <- predict(model, data, type = "score")
+    k <- ceiling(trial_top_percent * N)
+    top_indices <- order(scores, decreasing = TRUE)[1:k]
+    selected_counts[top_indices] <- selected_counts[top_indices] + 1
+  }
+
+  nonzero <- which(selected_counts > 0)
+  if (length(nonzero) == 0) {
+    warning("No points selected in any trial.")
+    return(integer(0))
+  }
+
+  final_indices <- order(selected_counts[nonzero], decreasing = TRUE)[1:min(final_top_k, length(nonzero))]
+  final_indices <- nonzero[final_indices]
+  return(sort(final_indices))  
+}
+
+```
+
+
+
+Combined Isolation Forest (Coarse + Fine) function
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+integrated_iforest <- function(data,
+                               true_anomalies,
+                               coarse_trial_top_percent = 0.05,
+                               coarse_final_top_percent = 0.10,
+                               fine_trial_top_percent = 0.15) {
+  # --- Step 1. Coarse model parameters ---
+  coarse_n_trials <- 100
+  coarse_ntrees <- 600
+  coarse_sample_size <- 192
+  coarse_ndim <- 1
+  coarse_weight_prob <- 0.05
+
+  # --- Step 2. Fine model parameters ---
+  fine_n_trials <- 100
+  fine_ntrees <- 3000
+  fine_sample_size <- 224
+  fine_ndim <- 6
+  fine_weight_prob <- 0.35
+  fine_final_top_k <- 1726
+
+  # --- Step 3. Run Coarse Model ---
+  cat("Running Coarse Isolation Forest...\n")
+  coarse_candidates <- coarse_iforest(
+    data = data,
+    trial_top_percent = coarse_trial_top_percent,
+    final_top_percent = coarse_final_top_percent,
+    n_trials = coarse_n_trials,
+    ntrees = coarse_ntrees,
+    sample_size = coarse_sample_size,
+    ndim = coarse_ndim,
+    weight_prob = coarse_weight_prob
+  )
+
+  # --- Step 4. Subset data for Fine Model ---
+  data_subset <- data[coarse_candidates, , drop = FALSE]
+
+  # --- Step 5. Run Fine Model ---
+  cat("Running Fine Isolation Forest...\n")
+  fine_indices_local <- fine_iforest(
+    data = data_subset,
+    trial_top_percent = fine_trial_top_percent,
+    n_trials = fine_n_trials,
+    ntrees = fine_ntrees,
+    sample_size = fine_sample_size,
+    ndim = fine_ndim,
+    weight_prob = fine_weight_prob,
+    final_top_k = fine_final_top_k
+  )
+
+  # Map fine model indices back to global indices
+  fine_indices_global <- coarse_candidates[fine_indices_local]
+
+  # --- Step 6. Compute precision ---
+  tp <- sum(fine_indices_global %in% true_anomalies)
+  precision <- tp / length(fine_indices_global)
+
+  # --- Step 7. Compute coarse recall ---
+  tp_coarse <- sum(coarse_candidates %in% true_anomalies)
+  recall_coarse <- tp_coarse / length(true_anomalies)
+
+  # --- Step 8. Output results ---
+  cat("Precision =", round(precision, 4), "\n")
+  cat("Coarse Recall =", round(recall_coarse, 4), "\n")
+
+  return(list(
+    precision = precision,
+    recall_coarse = recall_coarse,
+    coarse_candidates = coarse_candidates,
+    fine_indices = fine_indices_global
+  ))
+}
+```
+
+
+sensitivity analysis:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# ====== 1. Coarse model: sensitivity on trial_top_percent ======
+coarse_trial_values <- c(0.10, 0.15, 0.20)
+coarse_trial_results <- list()
+
+for (tp in coarse_trial_values) {
+  cat("Running Coarse trial_top_percent =", tp, "\n")
+  res <- integrated_iforest(
+    data = data_no_time,
+    true_anomalies = anomalies,                 
+    coarse_trial_top_percent = tp,              # vary trial_top_percent
+    coarse_final_top_percent = 0.15,            # new default
+    fine_trial_top_percent = 0.10               # new default
+  )
+  coarse_trial_results[[as.character(tp)]] <- res
+}
+
+cat("\n--- Coarse Model trial_top_percent Sensitivity ---\n")
+print(coarse_trial_results)
+cat("\n")
+
+# ====== 2. Coarse model: sensitivity on final_top_percent ======
+coarse_final_values <- c(0.10, 0.15, 0.20)
+coarse_final_results <- list()
+
+for (fp in coarse_final_values) {
+  cat("Running Coarse final_top_percent =", fp, "\n")
+  res <- integrated_iforest(
+    data = data_no_time,
+    true_anomalies = anomalies,
+    coarse_trial_top_percent = 0.20,            # new default
+    coarse_final_top_percent = fp,              # vary final_top_percent
+    fine_trial_top_percent = 0.10               # new default
+  )
+  coarse_final_results[[as.character(fp)]] <- res
+}
+
+cat("\n--- Coarse Model final_top_percent Sensitivity ---\n")
+print(coarse_final_results)
+cat("\n")
+
+# ====== 3. Fine model: sensitivity on trial_top_percent ======
+fine_trial_values <- c(0.05, 0.10, 0.15)
+fine_trial_results <- list()
+
+for (tp in fine_trial_values) {
+  cat("Running Fine trial_top_percent =", tp, "\n")
+  res <- integrated_iforest(
+    data = data_no_time,
+    true_anomalies = anomalies,
+    coarse_trial_top_percent = 0.20,            # new default
+    coarse_final_top_percent = 0.15,            # new default
+    fine_trial_top_percent = tp                 # vary fine model parameter
+  )
+  fine_trial_results[[as.character(tp)]] <- res
+}
+
+# ====== 4. Summary table ======
+sensitivity_summary <- data.frame(
+  Setting = c(rep("Coarse trial_top_percent", length(coarse_trial_values)),
+              rep("Coarse final_top_percent", length(coarse_final_values)),
+              rep("Fine trial_top_percent", length(fine_trial_values))),
+  Value = c(coarse_trial_values, coarse_final_values, fine_trial_values),
+  Precision = c(
+    sapply(coarse_trial_results, function(x) x$precision),
+    sapply(coarse_final_results, function(x) x$precision),
+    sapply(fine_trial_results, function(x) x$precision)
+  ),
+  Recall = c(
+    sapply(coarse_trial_results, function(x) x$recall_coarse),
+    sapply(coarse_final_results, function(x) x$recall_coarse),
+    sapply(fine_trial_results, function(x) x$recall_coarse)
+  )
+)
+
+print(sensitivity_summary)
+```
+
+
+
+

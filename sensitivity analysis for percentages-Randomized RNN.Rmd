@@ -1,0 +1,242 @@
+---
+title: "sensitivity analysis for percentages-Randomized RNN"
+author: "Joshua Lu"
+date: "2025-10-18"
+output: html_document
+---
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(torch)
+library(dplyr)
+
+file_path <- "Synthetic_High-Dimensional_Time_Series_Data.csv"
+time_series_data <- read.csv(file_path)
+true_anomalies <- c(8, 92, 122, 127, 130, 149, 150, 159, 164, 196)
+
+# Preprocessing
+num_features <- ncol(time_series_data) - 1
+time_series_data[, 1:num_features] <- scale(
+  time_series_data[, 1:num_features],
+  center = TRUE,
+  scale = TRUE
+)
+features <- as.matrix(time_series_data[, 1:num_features])
+result   <- as.numeric(time_series_data$Result)
+features_tensor <- torch_tensor(features, dtype = torch_float())
+result_tensor <- torch_tensor(result,   dtype = torch_float())
+
+# Coarse-grained model function
+rnn_coarse <- function(hidden_size, lr, dropout_rate, epochs, seq_len, batch_size,
+                       detection_percent = 0.95, final_percent = 0.1) {  # added two parameters
+  count <- rep(0, nrow(features))
+  rrnn_model <- nn_module(
+    "RRNN_Model",
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])  # last time step
+      out <- self$fc(out)
+      out
+    }
+  )
+  for (i in 1:200) {
+    set.seed(i)
+    torch_manual_seed(i)
+    model <- rrnn_model(ncol(features), hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+      loss <- criterion(outputs$squeeze(), result_tensor)
+      loss$backward()
+      optimizer$step()
+    }
+    model$eval()
+    predictions <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+    predictions <- as.numeric(predictions$squeeze())
+    error_scores <- abs(result - predictions)
+    threshold <- quantile(error_scores, detection_percent)  
+    detected_anomalies <- which(error_scores > threshold)
+    count[detected_anomalies] <- count[detected_anomalies] + 1
+  }
+  top_final_percent <- round(nrow(features) * final_percent) 
+  final_anomalies <- order(count, decreasing = TRUE)[1:top_final_percent]
+  return(final_anomalies)
+}
+
+# Fine-grained model function
+rnn_fine <- function(hidden_size, lr, dropout_rate, epochs, seq_len, batch_size, count,
+                     detection_percent = 0.95) {
+  count_votes <- rep(0, length(count))  
+  names(count_votes) <- count  
+  rrnn_fine_model <- nn_module(
+    "RRNN_Fine_Model",
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])  # last time step output
+      out <- self$fc(out)
+      out
+    }
+  )
+  num_experiments <- 200
+  for (i in 1:num_experiments) {
+    set.seed(i)          
+    torch_manual_seed(i)  
+    model     <- rrnn_fine_model(ncol(features), hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+      loss    <- criterion(outputs$squeeze(), result_tensor)
+      loss$backward()
+      optimizer$step()
+    }
+    model$eval()
+    predictions  <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+    predictions  <- as.numeric(predictions$squeeze())
+    error_scores <- abs(result - predictions)
+    fine_anomalies_scores <- error_scores[count]
+
+    threshold <- quantile(fine_anomalies_scores, detection_percent)  
+    detected_fine_anomalies <- count[fine_anomalies_scores > threshold]
+    count_votes[as.character(detected_fine_anomalies)] <- 
+      count_votes[as.character(detected_fine_anomalies)] + 1
+  }
+
+  final_fine_anomalies <- names(sort(count_votes, decreasing = TRUE))
+  return(final_fine_anomalies[1:10])
+}
+```
+
+
+Two-layer RNN anomaly detection pipeline:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+rnn_two_stage <- function(data,
+                          detection_percent_coarse,
+                          final_percent_coarse,
+                          detection_percent_fine) {
+
+  # Step 1: Coarse-grained model
+  coarse_anomalies <- rnn_coarse(
+    hidden_size = 50,
+    lr = 0.022,
+    dropout_rate = 0.25,
+    epochs = 50,
+    seq_len = 25,
+    batch_size = 200,
+    detection_percent = detection_percent_coarse,
+    final_percent = final_percent_coarse
+  )
+
+  # Step 2: Fine-grained model
+  fine_anomalies <- rnn_fine(
+    hidden_size = 130,
+    lr = 0.0013,
+    dropout_rate = 0.02,
+    epochs = 270,
+    seq_len = 8,
+    batch_size = 96,
+    count = coarse_anomalies,
+    detection_percent = detection_percent_fine
+  )
+
+  # Step 3: Calculate precision
+  true_anomalies <- c(8, 92, 122, 127, 130, 149, 150, 159, 164, 196)
+  tp <- sum(as.numeric(fine_anomalies) %in% true_anomalies)
+  precision <- tp / length(fine_anomalies)
+
+  # Step 4: Calculate coarse recall
+  tp_coarse <- sum(as.numeric(coarse_anomalies) %in% true_anomalies)
+  recall_coarse <- tp_coarse / length(true_anomalies)
+
+  # Output both metrics
+  return(list(
+    precision = precision,
+    recall_coarse = recall_coarse
+  ))
+}
+```
+
+
+Sensitivity analysis:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# sensitivity 1: coarse model detection percentile
+coarse_percentiles <- c(0.93, 0.95, 0.97)
+coarse_percentile_results <- list()
+for (p in coarse_percentiles) {
+  cat("Running coarse detection_percent =", p, "\n")
+  coarse_percentile_results[[as.character(p)]] <-
+    rnn_two_stage(
+      data = time_series_data,
+      detection_percent_coarse = p,
+      final_percent_coarse = 0.10,
+      detection_percent_fine = 0.95
+    )
+}
+
+# sensitivity 2: coarse model final output percentage
+coarse_final_percents <- c(0.05, 0.10, 0.15)
+coarse_final_results <- list()
+for (fp in coarse_final_percents) {
+  cat("Running coarse final_percent =", fp, "\n")
+  coarse_final_results[[as.character(fp)]] <-
+    rnn_two_stage(
+      data = time_series_data,
+      detection_percent_coarse = 0.95,
+      final_percent_coarse = fp,
+      detection_percent_fine = 0.95
+    )
+}
+
+# sensitivity 3: fine model detection percentile
+fine_percentiles <- c(0.93, 0.95, 0.97)
+fine_percentile_results <- list()
+for (p in fine_percentiles) {
+  cat("Running fine detection_percent =", p, "\n")
+  fine_percentile_results[[as.character(p)]] <-
+    rnn_two_stage(
+      data = time_series_data,
+      detection_percent_coarse = 0.95,
+      final_percent_coarse = 0.10,
+      detection_percent_fine = p
+    )
+}
+
+# Combine results into data frames
+coarse_det_df <- data.frame(
+  setting = "coarse_detection_percentile",
+  value = as.numeric(names(coarse_percentile_results)),
+  precision = sapply(coarse_percentile_results, function(x) x$precision),
+  recall = sapply(coarse_percentile_results, function(x) x$recall_coarse),
+  row.names = NULL
+)
+
+coarse_final_df <- data.frame(
+  setting = "coarse_final_percent",
+  value = as.numeric(names(coarse_final_results)),
+  precision = sapply(coarse_final_results, function(x) x$precision),
+  recall = sapply(coarse_final_results, function(x) x$recall_coarse),
+  row.names = NULL
+)
+
+fine_det_df <- data.frame(
+  setting = "fine_detection_percentile",
+  value = as.numeric(names(fine_percentile_results)),
+  precision = sapply(fine_percentile_results, function(x) x$precision),
+  recall = sapply(fine_percentile_results, function(x) x$recall_coarse),
+  row.names = NULL
+)
+```

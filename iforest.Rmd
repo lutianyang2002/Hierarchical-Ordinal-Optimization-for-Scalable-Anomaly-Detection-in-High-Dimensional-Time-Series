@@ -1,0 +1,534 @@
+---
+title: "iforest"
+output: html_document
+date: "2025-08-31"
+---
+
+Define the coarse-grained model function: 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(isotree)
+
+data_raw <- read.csv("water.csv")
+non_na_mask <- complete.cases(data_raw)
+data <- data_raw[non_na_mask, ]
+event_flag <- data$EVENT
+anomalies <- which(event_flag == TRUE)
+data_no_time <- data[, !(names(data) %in% c("Time", "EVENT"))]
+
+coarse_iforest <- function(data, trial_top_percent = 0.05,  
+                                 final_top_percent = 0.10, 
+                                 n_trials = 100,
+                                 ntrees = 100,
+                                 sample_size = 256,
+                                 ndim = 1,
+                                 weight_prob = 0.0) {
+  data <- as.matrix(data)
+  N <- nrow(data)
+  selected_counts <- rep(0, N)
+  
+  for (trial in 1:n_trials) {
+    set.seed(2025 + trial)
+    model <- isolation.forest(data,
+                              ntrees = ntrees,
+                              sample_size = sample_size,
+                              ndim = ndim,
+                              prob_pick_avg_gain = weight_prob)
+    
+    scores <- predict(model, data, type = "score")
+    
+    k <- ceiling(trial_top_percent * N)
+    top_indices <- order(scores, decreasing = TRUE)[1:k]
+    selected_counts[top_indices] <- selected_counts[top_indices] + 1
+  }
+  
+  m <- ceiling(final_top_percent * N)
+  nonzero <- which(selected_counts > 0)
+  
+  if (length(nonzero) == 0) {
+    warning("No points were detected as anomalies in any trial.")
+    return(integer(0))
+  }
+  
+  final_indices <- order(selected_counts[nonzero], decreasing = TRUE)[1:min(m, length(nonzero))]
+  final_indices <- nonzero[final_indices]
+  sort(final_indices)
+}
+```
+
+
+Construct coarse-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Coarse-grained model 1
+result1 <- coarse_iforest(
+  data_no_time,
+  trial_top_percent = 0.20,
+  final_top_percent = 0.15,
+  n_trials = 100,
+  ntrees = 600,
+  sample_size = 192,
+  ndim = 1,
+  weight_prob = 0.05
+)
+recall1 <- length(intersect(result1, anomalies)) / length(anomalies)
+precision1 <- length(intersect(result1, anomalies)) / length(result1)
+cat("Model1 - Recall:", round(recall1, 4), "Precision:", round(precision1, 4), "\n")
+# Model1 - Recall: 0.9502 Precision: 0.0789
+
+# Coarse-grained model 2
+result2 <- coarse_iforest(
+  data_no_time,
+  trial_top_percent = 0.20,
+  final_top_percent = 0.15,
+  n_trials = 100,
+  ntrees = 750,
+  sample_size = 256,
+  ndim = 1,
+  weight_prob = 0.05
+)
+recall2 <- length(intersect(result2, anomalies)) / length(anomalies)
+precision2 <- length(intersect(result2, anomalies)) / length(result2)
+cat("Model2 - Recall:", round(recall2, 4), "Precision:", round(precision2, 4), "\n")
+# Model2 - Recall: 0.9565 Precision: 0.0795
+
+# Coarse-grained model 3
+result3 <- coarse_iforest(
+  data_no_time,
+  trial_top_percent = 0.20,
+  final_top_percent = 0.15,
+  n_trials = 100,
+  ntrees = 800,
+  sample_size = 256,
+  ndim = 1,
+  weight_prob = 0.03
+)
+recall3 <- length(intersect(result3, anomalies)) / length(anomalies)
+precision3 <- length(intersect(result3, anomalies)) / length(result3)
+cat("Model3 - Recall:", round(recall3, 4), "Precision:", round(precision3, 4), "\n")
+# Model3 - Recall: 0.9537 Precision: 0.0792
+```
+
+
+Select three potential anomalies subsets:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+data_sub1 <- data_no_time[result1, ]
+data_sub2 <- data_no_time[result2, ]
+data_sub3 <- data_no_time[result3, ]
+```
+
+
+Define the fine-grained model function: 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+fine_iforest <- function(data,
+                         trial_top_percent = 0.15,
+                         n_trials = 300,
+                         ntrees = 100,
+                         sample_size = 256,
+                         ndim = 1,
+                         weight_prob = 0.0,
+                         final_top_k = 1726) {
+  data <- as.matrix(data)
+  N <- nrow(data)
+  selected_counts <- rep(0, N)
+
+  for (trial in 1:n_trials) {
+    set.seed(2025 + trial)
+    model <- isolation.forest(data,
+                              ntrees = ntrees,
+                              sample_size = sample_size,
+                              ndim = ndim,
+                              prob_pick_avg_gain = weight_prob)
+    scores <- predict(model, data, type = "score")
+    k <- ceiling(trial_top_percent * N)
+    top_indices <- order(scores, decreasing = TRUE)[1:k]
+    selected_counts[top_indices] <- selected_counts[top_indices] + 1
+  }
+
+  nonzero <- which(selected_counts > 0)
+  if (length(nonzero) == 0) {
+    warning("No points selected in any trial.")
+    return(integer(0))
+  }
+
+  final_indices <- order(selected_counts[nonzero], decreasing = TRUE)[1:min(final_top_k, length(nonzero))]
+  final_indices <- nonzero[final_indices]
+  return(sort(final_indices))  
+}
+```
+
+
+Construct fine-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Fine-grained model 1
+res1_fine1 <- fine_iforest(
+  data = data_sub1,
+  trial_top_percent = 0.10,
+  n_trials = 100,
+  ntrees = 2400,
+  sample_size = 160,
+  ndim = 5,
+  weight_prob = 0.25,
+  final_top_k = 1726
+)
+result1_fine1 <- result1[res1_fine1]
+recall1_fine1 <- length(intersect(result1_fine1, anomalies)) / length(anomalies)
+precision1_fine1 <- length(intersect(result1_fine1, anomalies)) / length(result1_fine1)
+cat("result1_fine1 - Recall:", round(recall1_fine1, 4), "Precision:", round(precision1_fine1, 4), "\n")
+# result1_fine1 - Recall: 0.7642 Precision: 0.7642
+
+res2_fine1 <- fine_iforest(
+  data = data_sub2,
+  trial_top_percent = 0.10,
+  n_trials = 100,
+  ntrees = 2400,
+  sample_size = 160,
+  ndim = 5,
+  weight_prob = 0.25,
+  final_top_k = 1726
+)
+result2_fine1 <- result2[res2_fine1]
+recall2_fine1 <- length(intersect(result2_fine1, anomalies)) / length(anomalies)
+precision2_fine1 <- length(intersect(result2_fine1, anomalies)) / length(result2_fine1)
+cat("result2_fine1 - Recall:", round(recall2_fine1, 4), "Precision:", round(precision2_fine1, 4), "\n")
+# result2_fine1 - Recall: 0.7329 Precision: 0.7329
+
+res3_fine1 <- fine_iforest(
+  data = data_sub3,
+  trial_top_percent = 0.10,
+  n_trials = 100,
+  ntrees = 2400,
+  sample_size = 160,
+  ndim = 5,
+  weight_prob = 0.25,
+  final_top_k = 1726
+)
+result3_fine1 <- result3[res3_fine1]
+recall3_fine1 <- length(intersect(result3_fine1, anomalies)) / length(anomalies)
+precision3_fine1 <- length(intersect(result3_fine1, anomalies)) / length(result3_fine1)
+cat("result3_fine1 - Recall:", round(recall3_fine1, 4), "Precision:", round(precision3_fine1, 4), "\n")
+# result3_fine1 - Recall: 0.7271 Precision: 0.7271
+
+# Fine-grained model 2
+res1_fine2 <- fine_iforest(
+  data = data_sub1,
+  trial_top_percent = 0.10,
+  n_trials = 100,
+  ntrees = 3000,
+  sample_size = 224,
+  ndim = 6,
+  weight_prob = 0.35,
+  final_top_k = 1726
+)
+result1_fine2 <- result1[res1_fine2]
+recall1_fine2 <- length(intersect(result1_fine2, anomalies)) / length(anomalies)
+precision1_fine2 <- length(intersect(result1_fine2, anomalies)) / length(result1_fine2)
+cat("result1_fine2 - Recall:", round(recall1_fine2, 4), "Precision:", round(precision1_fine2, 4), "\n")
+# result1_fine2 - Recall: 0.77 Precision: 0.77
+
+res2_fine2 <- fine_iforest(
+  data = data_sub2,
+  trial_top_percent = 0.10,
+  n_trials = 100,
+  ntrees = 3000,
+  sample_size = 224,
+  ndim = 6,
+  weight_prob = 0.35,
+  final_top_k = 1726
+)
+result2_fine2 <- result2[res2_fine2]
+recall2_fine2 <- length(intersect(result2_fine2, anomalies)) / length(anomalies)
+precision2_fine2 <- length(intersect(result2_fine2, anomalies)) / length(result2_fine2)
+cat("result2_fine2 - Recall:", round(recall2_fine2, 4), "Precision:", round(precision2_fine2, 4), "\n")
+# result2_fine2 - Recall: 0.7428 Precision: 0.7428
+
+res3_fine2 <- fine_iforest(
+  data = data_sub3,
+  trial_top_percent = 0.10,
+  n_trials = 100,
+  ntrees = 3000,
+  sample_size = 224,
+  ndim = 6,
+  weight_prob = 0.35,
+  final_top_k = 1726
+)
+result3_fine2 <- result3[res3_fine2]
+recall3_fine2 <- length(intersect(result3_fine2, anomalies)) / length(anomalies)
+precision3_fine2 <- length(intersect(result3_fine2, anomalies)) / length(result3_fine2)
+cat("result3_fine2 - Recall:", round(recall3_fine2, 4), "Precision:", round(precision3_fine2, 4), "\n")
+# result3_fine2 - Recall: 0.7242 Precision: 0.7242
+
+# Fine-grained model 3
+res1_fine3 <- fine_iforest(
+  data = data_sub1,
+  trial_top_percent = 0.10,
+  n_trials = 100,
+  ntrees = 3600,
+  sample_size = 256,
+  ndim = 6,
+  weight_prob = 0.38,
+  final_top_k = 1726
+)
+result1_fine3 <- result1[res1_fine3]
+recall1_fine3 <- length(intersect(result1_fine3, anomalies)) / length(anomalies)
+precision1_fine3 <- length(intersect(result1_fine3, anomalies)) / length(result1_fine3)
+cat("result1_fine3 - Recall:", round(recall1_fine3, 4), "Precision:", round(precision1_fine3, 4), "\n")
+# result1_fine3 - Recall: 0.763  Precision: 0.763
+
+res2_fine3 <- fine_iforest(
+  data = data_sub2,
+  trial_top_percent = 0.10,
+  n_trials = 100,
+  ntrees = 3600,
+  sample_size = 256,
+  ndim = 6,
+  weight_prob = 0.38,
+  final_top_k = 1726
+)
+result2_fine3 <- result2[res2_fine3]
+recall2_fine3 <- length(intersect(result2_fine3, anomalies)) / length(anomalies)
+precision2_fine3 <- length(intersect(result2_fine3, anomalies)) / length(result2_fine3)
+cat("result2_fine3 - Recall:", round(recall2_fine3, 4), "Precision:", round(precision2_fine3, 4), "\n")
+# result2_fine3 - Recall: 0.7323  Precision: 0.7323
+
+res3_fine3 <- fine_iforest(
+  data = data_sub3,
+  trial_top_percent = 0.10,
+  n_trials = 100,
+  ntrees = 3600,
+  sample_size = 256,
+  ndim = 6,
+  weight_prob = 0.38,
+  final_top_k = 1726
+)
+result3_fine3 <- result3[res3_fine3]
+recall3_fine3 <- length(intersect(result3_fine3, anomalies)) / length(anomalies)
+precision3_fine3 <- length(intersect(result3_fine3, anomalies)) / length(result3_fine3)
+cat("result3_fine3 - Recall:", round(recall3_fine3, 4), "Precision:", round(precision3_fine3, 4), "\n")
+# result3_fine3 - Recall: 0.7236  Precision: 0.7236
+```
+
+
+
+Define the function to compute Consistency Probability:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Define the main function
+compute_cp_by_score <- function(score_matrix_A, score_matrix_B) {
+  index_A <- score_matrix_A[1, ]
+  scores_A <- score_matrix_A[2, ]
+  index_B <- score_matrix_B[1, ]
+  scores_B <- score_matrix_B[2, ]
+
+  # Check if indices are identical
+  if (!all(index_A == index_B)) {
+    stop("The first-row indices of the two input matrices are not identical, cannot compare")
+  }
+
+  n <- length(index_A)
+  if (n < 2) stop("Less than 2 points, cannot compute CP value")
+
+  consistent <- 0
+  total_pairs <- 0
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      sign_A <- sign(scores_A[i] - scores_A[j])
+      sign_B <- sign(scores_B[i] - scores_B[j])
+
+      if (sign_A != 0 && sign_B != 0 && sign_A == sign_B) {
+        consistent <- consistent + 1
+      }
+      total_pairs <- total_pairs + 1
+    }
+  }
+  cp <- consistent / total_pairs
+  return(cp * 100)  # percentage
+}
+
+# Compute Anomaly Scores for Coarse-grained Models
+coarse_scoring <- function(data_full,
+                           target_indices,
+                           n_trials = 100,
+                           ntrees = 100,
+                           sample_size = 256,
+                           ndim = 1,
+                           weight_prob = 0.0) {
+  data_full <- as.matrix(data_full)
+  score_mat <- matrix(0, nrow = length(target_indices), ncol = n_trials)
+  for (i in 1:n_trials) {
+    set.seed(2025 + i)
+    model <- isolation.forest(data_full,
+                              ntrees = ntrees,
+                              sample_size = sample_size,
+                              ndim = ndim,
+                              prob_pick_avg_gain = weight_prob)
+    scores <- predict(model, data_full[target_indices, , drop = FALSE], type = "score")
+    score_mat[, i] <- scores
+  }
+  result_matrix <- rbind(target_indices, rowMeans(score_mat))
+  return(result_matrix)
+}
+
+# Compute Anomaly Scores for fine-grained Models
+fine_scoring <- function(data_full,
+                         coarse_indices,
+                         target_indices,
+                         n_trials = 100,
+                         ntrees = 100,
+                         sample_size = 256,
+                         ndim = 1,
+                         weight_prob = 0.0) {
+  data_full <- as.matrix(data_full)
+  data_subset <- data_full[coarse_indices, , drop = FALSE]
+  score_mat <- matrix(0, nrow = length(target_indices), ncol = n_trials)
+  for (i in 1:n_trials) {
+    set.seed(2025 + i)
+    model <- isolation.forest(data_subset,
+                              ntrees = ntrees,
+                              sample_size = sample_size,
+                              ndim = ndim,
+                              prob_pick_avg_gain = weight_prob)
+    scores <- predict(model, data_full[target_indices, , drop = FALSE], type = "score")
+    score_mat[, i] <- scores
+  }
+  result_matrix <- rbind(target_indices, rowMeans(score_mat))
+  return(result_matrix)
+}
+```
+
+
+
+Compute Consistency Probability values:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Coarse model scoring
+result1_fine1_coarse <- coarse_scoring(data_full = data_no_time, target_indices = result1_fine1, n_trials = 100, ntrees = 600, sample_size = 192, ndim = 1, weight_prob = 0.05)
+result1_fine2_coarse <- coarse_scoring(data_full = data_no_time, target_indices = result1_fine2, n_trials = 100, ntrees = 600, sample_size = 192, ndim = 1, weight_prob = 0.05)
+result1_fine3_coarse <- coarse_scoring(data_full = data_no_time, target_indices = result1_fine3, n_trials = 100, ntrees = 600, sample_size = 192, ndim = 1, weight_prob = 0.05)
+
+result2_fine1_coarse <- coarse_scoring(data_full = data_no_time, target_indices = result2_fine1, n_trials = 100, ntrees = 750, sample_size = 256, ndim = 1, weight_prob = 0.05)
+result2_fine2_coarse <- coarse_scoring(data_full = data_no_time, target_indices = result2_fine2, n_trials = 100, ntrees = 750, sample_size = 256, ndim = 1, weight_prob = 0.05)
+result2_fine3_coarse <- coarse_scoring(data_full = data_no_time, target_indices = result2_fine3, n_trials = 100, ntrees = 750, sample_size = 256, ndim = 1, weight_prob = 0.05)
+
+result3_fine1_coarse <- coarse_scoring(data_full = data_no_time, target_indices = result3_fine1, n_trials = 100, ntrees = 800, sample_size = 256, ndim = 1, weight_prob = 0.03)
+result3_fine2_coarse <- coarse_scoring(data_full = data_no_time, target_indices = result3_fine2, n_trials = 100, ntrees = 800, sample_size = 256, ndim = 1, weight_prob = 0.03)
+result3_fine3_coarse <- coarse_scoring(data_full = data_no_time, target_indices = result3_fine3, n_trials = 100, ntrees = 800, sample_size = 256, ndim = 1, weight_prob = 0.03)
+
+# Fine model scoring (using coarse model subset for training)
+result1_fine1_fine <- fine_scoring(data_full = data_no_time, coarse_indices = result1, target_indices = result1_fine1, n_trials = 100, ntrees = 2400, sample_size = 160, ndim = 5, weight_prob = 0.25)
+result2_fine1_fine <- fine_scoring(data_full = data_no_time, coarse_indices = result2, target_indices = result2_fine1, n_trials = 100, ntrees = 2400, sample_size = 160, ndim = 5, weight_prob = 0.25)
+result3_fine1_fine <- fine_scoring(data_full = data_no_time, coarse_indices = result3, target_indices = result3_fine1, n_trials = 100, ntrees = 2400, sample_size = 160, ndim = 5, weight_prob = 0.25)
+
+result1_fine2_fine <- fine_scoring(data_full = data_no_time, coarse_indices = result1, target_indices = result1_fine2, n_trials = 100, ntrees = 3000, sample_size = 224, ndim = 6, weight_prob = 0.35)
+result2_fine2_fine <- fine_scoring(data_full = data_no_time, coarse_indices = result2, target_indices = result2_fine2, n_trials = 100, ntrees = 3000, sample_size = 224, ndim = 6, weight_prob = 0.35)
+result3_fine2_fine <- fine_scoring(data_full = data_no_time, coarse_indices = result3, target_indices = result3_fine2, n_trials = 100, ntrees = 3000, sample_size = 224, ndim = 6, weight_prob = 0.35)
+
+result1_fine3_fine <- fine_scoring(data_full = data_no_time, coarse_indices = result1, target_indices = result1_fine3, n_trials = 100, ntrees = 3600, sample_size = 256, ndim = 6, weight_prob = 0.38)
+result2_fine3_fine <- fine_scoring(data_full = data_no_time, coarse_indices = result2, target_indices = result2_fine3, n_trials = 100, ntrees = 3600, sample_size = 256, ndim = 6, weight_prob = 0.38)
+result3_fine3_fine <- fine_scoring(data_full = data_no_time, coarse_indices = result3, target_indices = result3_fine3, n_trials = 100, ntrees = 3600, sample_size = 256, ndim = 6, weight_prob = 0.38)
+
+# CP value computation
+cp1_fine1 <- compute_cp_by_score(result1_fine1_coarse, result1_fine1_fine)
+cp2_fine1 <- compute_cp_by_score(result2_fine1_coarse, result2_fine1_fine)
+cp3_fine1 <- compute_cp_by_score(result3_fine1_coarse, result3_fine1_fine)
+
+cp1_fine2 <- compute_cp_by_score(result1_fine2_coarse, result1_fine2_fine)
+cp2_fine2 <- compute_cp_by_score(result2_fine2_coarse, result2_fine2_fine)
+cp3_fine2 <- compute_cp_by_score(result3_fine2_coarse, result3_fine2_fine)
+
+cp1_fine3 <- compute_cp_by_score(result1_fine3_coarse, result1_fine3_fine)
+cp2_fine3 <- compute_cp_by_score(result2_fine3_coarse, result2_fine3_fine)
+cp3_fine3 <- compute_cp_by_score(result3_fine3_coarse, result3_fine3_fine)
+
+# Output results
+cat("CP(result1, fine1):", round(cp1_fine1, 4), "\n")
+# CP(result1, fine1): 71.9068
+cat("CP(result2, fine1):", round(cp2_fine1, 4), "\n")
+# CP(result2, fine1): 71.5181
+cat("CP(result3, fine1):", round(cp3_fine1, 4), "\n")
+# CP(result3, fine1): 69.995
+
+cat("CP(result1, fine2):", round(cp1_fine2, 4), "\n")
+# CP(result1, fine2): 70.6049
+cat("CP(result2, fine2):", round(cp2_fine2, 4), "\n")
+# CP(result2, fine2): 70.7657
+cat("CP(result3, fine2):", round(cp3_fine2, 4), "\n")
+# CP(result3, fine2): 69.9045
+
+cat("CP(result1, fine3):", round(cp1_fine3, 4), "\n")
+# CP(result1, fine3): 70.7731
+cat("CP(result2, fine3):", round(cp2_fine3, 4), "\n")
+# CP(result2, fine3): 70.3268 
+cat("CP(result3, fine3):", round(cp3_fine3, 4), "\n")
+# CP(result3, fine3): 69.2416 
+```
+
+
+
+
+
+Visualization: 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+
+# Create a general dataframe building function
+build_df <- function(result, anomalies, name, row_index) {
+  all_idx <- sort(unique(c(result, anomalies)))
+  data.frame(
+    index = all_idx,
+    method = name,
+    row = row_index,
+    label = ifelse(all_idx %in% anomalies & all_idx %in% result, "Overlap",
+                   ifelse(all_idx %in% anomalies, "Missed", "False Positive"))
+  )
+}
+
+# Construct the main dataframe
+df_all <- data.frame(
+  index = anomalies,
+  method = "Ground Truth",
+  row = 1,
+  label = "True Anomaly"
+)
+
+# Add results from 9 models (rows 2–10)
+df_all <- bind_rows(
+  df_all,
+  build_df(result1_fine1, anomalies, "Result1_Fine1", 2),
+  build_df(result1_fine2, anomalies, "Result1_Fine2", 3),
+  build_df(result1_fine3, anomalies, "Result1_Fine3", 4),
+  build_df(result2_fine1, anomalies, "Result2_Fine1", 5),
+  build_df(result2_fine2, anomalies, "Result2_Fine2", 6),
+  build_df(result2_fine3, anomalies, "Result2_Fine3", 7),
+  build_df(result3_fine1, anomalies, "Result3_Fine1", 8),
+  build_df(result3_fine2, anomalies, "Result3_Fine2", 9),
+  build_df(result3_fine3, anomalies, "Result3_Fine3", 10)
+)
+
+# Set color mapping
+color_map <- c(
+  "True Anomaly" = "black",
+  "Overlap" = "red",
+  "Missed" = "blue",
+  "False Positive" = "orange"
+)
+
+# Set y-axis labels
+row_labels <- c("Ground Truth",
+                "Result1_Fine1", "Result1_Fine2", "Result1_Fine3",
+                "Result2_Fine1", "Result2_Fine2", "Result2_Fine3",
+                "Result3_Fine1", "Result3_Fine2", "Result3_Fine3")
+
+# Plot
+ggplot(df_all, aes(x = index, y = row, color = label)) +
+  geom_point(size = 1.8, alpha = 0.8) +
+  scale_color_manual(values = color_map) +
+  scale_y_continuous(breaks = 1:10, labels = row_labels, trans = "reverse") +
+  labs(x = "Time Index", y = "Method / Ground Truth", color = "Status") +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 10),
+        legend.position = "bottom",
+        legend.text  = element_text(size = 20),
+        legend.title = element_text(size = 16)
+        )
+
+```
+

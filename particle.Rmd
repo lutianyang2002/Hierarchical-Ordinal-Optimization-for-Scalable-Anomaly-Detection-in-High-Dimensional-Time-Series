@@ -1,0 +1,433 @@
+---
+title: "particle"
+output: html_document
+date: "2025-09-03"
+---
+
+Define the coarse-grained model function: 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+file_path <- "Synthetic_High-Dimensional_Time_Series_Data.csv"
+time_series_data <- read.csv(file_path)
+result <- as.numeric(time_series_data$Result)  # target series used by the PF
+
+# Coarse-grained model function
+pf_coarse <- function(num_particles, sigma_process, sigma_measure,
+                      threshold_percentile, num_trials) {
+  anomaly_scores <- rep(0, length(result))
+  for (trial in 1:num_trials) {
+    particles <- rnorm(num_particles, mean = result[1], sd = sigma_process)
+    weights <- rep(1 / num_particles, num_particles)
+    for (t in 2:length(result)) {
+      # Prediction step (state transition)
+      particles <- particles + rnorm(num_particles, mean = 0, sd = sigma_process)
+
+      # Measurement update (likelihood)
+      likelihood <- dnorm(result[t], mean = particles, sd = sigma_measure)
+      weights <- weights * likelihood
+      weights <- weights / sum(weights)
+
+      # Estimated state as weighted mean
+      estimate <- sum(particles * weights)
+
+      # Accumulate absolute error as anomaly score
+      anomaly_scores[t] <- anomaly_scores[t] + abs(result[t] - estimate)
+
+      # Resampling step
+      indices <- sample(1:num_particles, size = num_particles, replace = TRUE, prob = weights)
+      particles <- particles[indices]
+      weights <- rep(1 / num_particles, num_particles)
+    }
+  }
+
+  # Average anomaly scores across trials
+  anomaly_scores <- anomaly_scores / num_trials
+
+  top_k <- round(0.1 * length(result))
+  return(order(anomaly_scores, decreasing = TRUE)[1:top_k])
+}
+```
+
+
+Construct coarse-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Ground truth
+true_anomalies <- c(8, 92, 122, 127, 130, 149, 150, 159, 164, 196)
+
+# Compute recall
+compute_recall <- function(detected, truth) {
+  length(intersect(detected, truth)) / length(true_anomalies)
+}
+
+# Coarse-grained model 1
+result1 <- pf_coarse(
+  num_particles = 3500,
+  sigma_process = 0.55,
+  sigma_measure = 0.65,
+  threshold_percentile = 80,
+  num_trials = 100
+)
+recall1 <- compute_recall(result1, true_anomalies)
+cat("Recall (Model 1):", round(recall1, 4), "\n")
+
+# Coarse-grained model 2
+result2 <- pf_coarse(
+  num_particles = 4000,
+  sigma_process = 0.50,
+  sigma_measure = 0.68,
+  threshold_percentile = 80,
+  num_trials = 100
+)
+recall2 <- compute_recall(result2, true_anomalies)
+cat("Recall (Model 2):", round(recall2, 4), "\n")
+
+# Coarse-grained model 3
+result3 <- pf_coarse(
+  num_particles = 4500,
+  sigma_process = 0.48,
+  sigma_measure = 0.70,
+  threshold_percentile = 80,
+  num_trials = 100
+)
+recall3 <- compute_recall(result3, true_anomalies)
+cat("Recall (Model 3):", round(recall3, 4), "\n")
+```
+
+
+Define the fine-grained model function:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+pf_fine <- function(num_particles, sigma_process, sigma_measure,
+                    threshold_percentile, num_trials, count, result) {
+  anomaly_scores <- rep(0, length(result))
+  for (trial in 1:num_trials) {
+    particles <- rnorm(num_particles, mean = result[1], sd = sigma_process)
+    weights <- rep(1 / num_particles, num_particles)
+
+    # Sequential state update over time
+    for (t in 2:length(result)) {
+      # Prediction step
+      particles <- particles + rnorm(num_particles, mean = 0, sd = sigma_process)
+
+      # Measurement update
+      likelihood <- dnorm(result[t], mean = particles, sd = sigma_measure)
+      weights <- weights * likelihood
+      weights <- weights / sum(weights)
+
+      # Estimated state (weighted mean)
+      estimate <- sum(particles * weights)
+
+      # Accumulate absolute error as anomaly score (ONLY for indices in 'count')
+      if (t %in% count) {
+        anomaly_scores[t] <- anomaly_scores[t] + abs(result[t] - estimate)
+      }
+
+      # Resampling step
+      indices <- sample(1:num_particles, size = num_particles, replace = TRUE, prob = weights)
+      particles <- particles[indices]
+      weights <- rep(1 / num_particles, num_particles)
+    }
+  }
+
+  # Average scores across trials
+  anomaly_scores <- anomaly_scores / num_trials
+  filtered_scores <- anomaly_scores[count]
+  top_indices <- order(filtered_scores, decreasing = TRUE)[1:10]
+  return(count[top_indices])
+}
+```
+
+
+Define the fine-grained model function: 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Fine-grained model 1
+result1_fine1 <- pf_fine(num_particles = 9500, sigma_process = 0.45, sigma_measure = 0.88,
+                         threshold_percentile = 90, num_trials = 1000,
+                         count = result1, result = result)
+result2_fine1 <- pf_fine(num_particles = 9500, sigma_process = 0.45, sigma_measure = 0.88,
+                         threshold_percentile = 90, num_trials = 1000,
+                         count = result2, result = result)
+result3_fine1 <- pf_fine(num_particles = 9500, sigma_process = 0.45, sigma_measure = 0.88,
+                         threshold_percentile = 90, num_trials = 1000,
+                         count = result3, result = result)
+
+# Fine-grained model 2
+result1_fine2 <- pf_fine(num_particles = 10000, sigma_process = 0.40, sigma_measure = 0.90,
+                         threshold_percentile = 90, num_trials = 1000,
+                         count = result1, result = result)
+result2_fine2 <- pf_fine(num_particles = 10000, sigma_process = 0.40, sigma_measure = 0.90,
+                         threshold_percentile = 90, num_trials = 1000,
+                         count = result2, result = result)
+result3_fine2 <- pf_fine(num_particles = 10000, sigma_process = 0.40, sigma_measure = 0.90,
+                         threshold_percentile = 90, num_trials = 1000,
+                         count = result3, result = result)
+
+# Fine-grained model 3
+result1_fine3 <- pf_fine(num_particles = 10500, sigma_process = 0.42, sigma_measure = 0.92,
+                         threshold_percentile = 90, num_trials = 1000,
+                         count = result1, result = result)
+result2_fine3 <- pf_fine(num_particles = 10500, sigma_process = 0.42, sigma_measure = 0.92,
+                         threshold_percentile = 90, num_trials = 1000,
+                         count = result2, result = result)
+result3_fine3 <- pf_fine(num_particles = 10500, sigma_process = 0.42, sigma_measure = 0.92,
+                         threshold_percentile = 90, num_trials = 1000,
+                         count = result3, result = result)
+```
+
+
+Construct fine-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+compute_precision <- function(detected, truth) {
+  length(intersect(detected, truth)) / length(truth)
+}
+
+# Ground truth anomalies
+true_anomalies <- c(8, 92, 122, 127, 130, 149, 150, 159, 164, 196)
+
+
+# Fine-grained model 1
+prec1_fine1 <- compute_precision(result1_fine1, true_anomalies)
+prec2_fine1 <- compute_precision(result2_fine1, true_anomalies)
+prec3_fine1 <- compute_precision(result3_fine1, true_anomalies)
+
+cat("Precision - Fine1:\n")
+cat("  result1_fine1:", round(prec1_fine1, 4), "\n")
+cat("  result2_fine1:", round(prec2_fine1, 4), "\n")
+cat("  result3_fine1:", round(prec3_fine1, 4), "\n\n")
+
+
+# Fine-grained model 2
+prec1_fine2 <- compute_precision(result1_fine2, true_anomalies)
+prec2_fine2 <- compute_precision(result2_fine2, true_anomalies)
+prec3_fine2 <- compute_precision(result3_fine2, true_anomalies)
+
+cat("Precision - Fine2:\n")
+cat("  result1_fine2:", round(prec1_fine2, 4), "\n")
+cat("  result2_fine2:", round(prec2_fine2, 4), "\n")
+cat("  result3_fine2:", round(prec3_fine2, 4), "\n\n")
+
+
+# Fine-grained model 3
+prec1_fine3 <- compute_precision(result1_fine3, true_anomalies)
+prec2_fine3 <- compute_precision(result2_fine3, true_anomalies)
+prec3_fine3 <- compute_precision(result3_fine3, true_anomalies)
+
+cat("Precision - Fine3:\n")
+cat("  result1_fine3:", round(prec1_fine3, 4), "\n")
+cat("  result2_fine3:", round(prec2_fine3, 4), "\n")
+cat("  result3_fine3:", round(prec3_fine3, 4), "\n")
+```
+
+
+Define the function to compute Consistency Probability:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Define the main function
+compute_cp_by_score <- function(score_matrix_A, score_matrix_B) {
+  index_A <- score_matrix_A[1, ]
+  scores_A <- score_matrix_A[2, ]
+  index_B <- score_matrix_B[1, ]
+  scores_B <- score_matrix_B[2, ]
+
+  # Check if indices are identical
+  if (!all(index_A == index_B)) {
+    stop("The first-row indices of the two input matrices are not identical, cannot compare")
+  }
+
+  n <- length(index_A)
+  if (n < 2) stop("Less than 2 points, cannot compute CP value")
+
+  consistent <- 0
+  total_pairs <- 0
+
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      sAi <- scores_A[i]; sAj <- scores_A[j]
+      sBi <- scores_B[i]; sBj <- scores_B[j]
+      if (sAi == 1 && sAj == 1 && sBi == 1 && sBj == 1) {
+        consistent <- consistent + 1
+      } else {
+        sign_A <- sign(sAi - sAj)
+        sign_B <- sign(sBi - sBj)
+        if (sign_A != 0 && sign_B != 0 && sign_A == sign_B) {
+          consistent <- consistent + 1
+        }
+      }
+      total_pairs <- total_pairs + 1
+    }
+  }
+
+  cp <- consistent / total_pairs
+  return(cp * 100)  # percentage
+}
+
+# Compute Anomaly Scores for Coarse-grained Models
+coarse_scoring <- function(num_particles, sigma_process, sigma_measure,
+                           threshold_percentile, num_trials, indices) {
+  anomaly_scores <- rep(0, length(result))
+  for (trial in 1:num_trials) {
+    particles <- rnorm(num_particles, mean = result[1], sd = sigma_process)
+    weights <- rep(1 / num_particles, num_particles)
+    for (t in 2:length(result)) {
+      particles <- particles + rnorm(num_particles, mean = 0, sd = sigma_process)
+      likelihood <- dnorm(result[t], mean = particles, sd = sigma_measure)
+      weights <- weights * likelihood
+      weights <- weights / sum(weights)
+      estimate <- sum(particles * weights)
+      if (t %in% indices) {
+        anomaly_scores[t] <- anomaly_scores[t] + abs(result[t] - estimate)
+      }
+      indices_resample <- sample(1:num_particles, size = num_particles, replace = TRUE, prob = weights)
+      particles <- particles[indices_resample]
+      weights <- rep(1 / num_particles, num_particles)
+    }
+  }
+  anomaly_scores <- anomaly_scores / num_trials
+  scores <- anomaly_scores[indices]
+  return(rbind(indices, scores))
+}
+
+# Compute Anomaly Scores for Fine-grained Models
+fine_scoring <- function(num_particles, sigma_process, sigma_measure,
+                         threshold_percentile, num_trials, coarse_set, fine_indices, result) {
+  anomaly_scores <- rep(0, length(result))
+  for (trial in 1:num_trials) {
+    particles <- rnorm(num_particles, mean = result[1], sd = sigma_process)
+    weights <- rep(1 / num_particles, num_particles)
+    for (t in 2:length(result)) {
+      particles <- particles + rnorm(num_particles, mean = 0, sd = sigma_process)
+      likelihood <- dnorm(result[t], mean = particles, sd = sigma_measure)
+      weights <- weights * likelihood
+      weights <- weights / sum(weights)
+      estimate <- sum(particles * weights)
+      if (t %in% fine_indices) {
+        anomaly_scores[t] <- anomaly_scores[t] + abs(result[t] - estimate)
+      }
+      indices_resample <- sample(1:num_particles, size = num_particles, replace = TRUE, prob = weights)
+      particles <- particles[indices_resample]
+      weights <- rep(1 / num_particles, num_particles)
+    }
+  }
+  anomaly_scores <- anomaly_scores / num_trials
+  scores <- anomaly_scores[fine_indices]
+  return(rbind(fine_indices, scores))
+}
+```
+
+
+Compute Consistency Probability values:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Coarse model scoring
+# Coarse model scoring
+r1_fine1_coarse <- coarse_scoring(num_particles = 3500, sigma_process = 0.55, sigma_measure = 0.65,
+                                  threshold_percentile = 80, num_trials = 100,
+                                  indices = result1_fine1)
+r1_fine2_coarse <- coarse_scoring(num_particles = 3500, sigma_process = 0.55, sigma_measure = 0.65,
+                                  threshold_percentile = 80, num_trials = 100,
+                                  indices = result1_fine2)
+r1_fine3_coarse <- coarse_scoring(num_particles = 3500, sigma_process = 0.55, sigma_measure = 0.65,
+                                  threshold_percentile = 80, num_trials = 100,
+                                  indices = result1_fine3)
+
+r2_fine1_coarse <- coarse_scoring(num_particles = 4000, sigma_process = 0.50, sigma_measure = 0.68,
+                                  threshold_percentile = 80, num_trials = 100,
+                                  indices = result2_fine1)
+r2_fine2_coarse <- coarse_scoring(num_particles = 4000, sigma_process = 0.50, sigma_measure = 0.68,
+                                  threshold_percentile = 80, num_trials = 100,
+                                  indices = result2_fine2)
+r2_fine3_coarse <- coarse_scoring(num_particles = 4000, sigma_process = 0.50, sigma_measure = 0.68,
+                                  threshold_percentile = 80, num_trials = 100,
+                                  indices = result2_fine3)
+
+r3_fine1_coarse <- coarse_scoring(num_particles = 4500, sigma_process = 0.48, sigma_measure = 0.70,
+                                  threshold_percentile = 80, num_trials = 100,
+                                  indices = result3_fine1)
+r3_fine2_coarse <- coarse_scoring(num_particles = 4500, sigma_process = 0.48, sigma_measure = 0.70,
+                                  threshold_percentile = 80, num_trials = 100,
+                                  indices = result3_fine2)
+r3_fine3_coarse <- coarse_scoring(num_particles = 4500, sigma_process = 0.48, sigma_measure = 0.70,
+                                  threshold_percentile = 80, num_trials = 100,
+                                  indices = result3_fine3)
+
+# Fine model scoring (using coarse model subset for training)
+r1_fine1_fine <- fine_scoring(num_particles = 9500, sigma_process = 0.45, sigma_measure = 0.88,
+                              threshold_percentile = 90, num_trials = 1000,
+                              coarse_set = result1, fine_indices = result1_fine1, result = result)
+r2_fine1_fine <- fine_scoring(num_particles = 9500, sigma_process = 0.45, sigma_measure = 0.88,
+                              threshold_percentile = 90, num_trials = 1000,
+                              coarse_set = result2, fine_indices = result2_fine1, result = result)
+r3_fine1_fine <- fine_scoring(num_particles = 9500, sigma_process = 0.45, sigma_measure = 0.88,
+                              threshold_percentile = 90, num_trials = 1000,
+                              coarse_set = result3, fine_indices = result3_fine1, result = result)
+
+r1_fine2_fine <- fine_scoring(num_particles = 10000, sigma_process = 0.40, sigma_measure = 0.90,
+                              threshold_percentile = 90, num_trials = 1000,
+                              coarse_set = result1, fine_indices = result1_fine2, result = result)
+r2_fine2_fine <- fine_scoring(num_particles = 10000, sigma_process = 0.40, sigma_measure = 0.90,
+                              threshold_percentile = 90, num_trials = 1000,
+                              coarse_set = result2, fine_indices = result2_fine2, result = result)
+r3_fine2_fine <- fine_scoring(num_particles = 10000, sigma_process = 0.40, sigma_measure = 0.90,
+                              threshold_percentile = 90, num_trials = 1000,
+                              coarse_set = result3, fine_indices = result3_fine2, result = result)
+
+r1_fine3_fine <- fine_scoring(num_particles = 10500, sigma_process = 0.38, sigma_measure = 0.92,
+                              threshold_percentile = 90, num_trials = 1000,
+                              coarse_set = result1, fine_indices = result1_fine3, result = result)
+r2_fine3_fine <- fine_scoring(num_particles = 10500, sigma_process = 0.38, sigma_measure = 0.92,
+                              threshold_percentile = 90, num_trials = 1000,
+                              coarse_set = result2, fine_indices = result2_fine3, result = result)
+r3_fine3_fine <- fine_scoring(num_particles = 10500, sigma_process = 0.38, sigma_measure = 0.92,
+                              threshold_percentile = 90, num_trials = 1000,
+                              coarse_set = result3, fine_indices = result3_fine3, result = result)
+
+
+# CP value computation
+cp_r1_f1 <- compute_cp_by_score(r1_fine1_coarse, r1_fine1_fine)
+cp_r2_f1 <- compute_cp_by_score(r2_fine1_coarse, r2_fine1_fine)
+cp_r3_f1 <- compute_cp_by_score(r3_fine1_coarse, r3_fine1_fine)
+
+cp_r1_f2 <- compute_cp_by_score(r1_fine2_coarse, r1_fine2_fine)
+cp_r2_f2 <- compute_cp_by_score(r2_fine2_coarse, r2_fine2_fine)
+cp_r3_f2 <- compute_cp_by_score(r3_fine2_coarse, r3_fine2_fine)
+
+cp_r1_f3 <- compute_cp_by_score(r1_fine3_coarse, r1_fine3_fine)
+cp_r2_f3 <- compute_cp_by_score(r2_fine3_coarse, r2_fine3_fine)
+cp_r3_f3 <- compute_cp_by_score(r3_fine3_coarse, r3_fine3_fine)
+
+# Output results
+cat("CP(result1, fine1):", round(cp_r1_f1, 4), "%\n")
+cat("CP(result2, fine1):", round(cp_r2_f1, 4), "%\n")
+cat("CP(result3, fine1):", round(cp_r3_f1, 4), "%\n\n")
+
+cat("CP(result1, fine2):", round(cp_r1_f2, 4), "%\n")
+cat("CP(result2, fine2):", round(cp_r2_f2, 4), "%\n")
+cat("CP(result3, fine2):", round(cp_r3_f2, 4), "%\n\n")
+
+cat("CP(result1, fine3):", round(cp_r1_f3, 4), "%\n")
+cat("CP(result2, fine3):", round(cp_r2_f3, 4), "%\n")
+cat("CP(result3, fine3):", round(cp_r3_f3, 4), "%\n")
+```
+
+Visualization:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+detected_all <- sort(unique(c(
+  intersect(as.integer(result1_fine1), true_anomalies),
+  intersect(as.integer(result1_fine2), true_anomalies),
+  intersect(as.integer(result1_fine3), true_anomalies),
+  intersect(as.integer(result2_fine1), true_anomalies),
+  intersect(as.integer(result2_fine2), true_anomalies),
+  intersect(as.integer(result2_fine3), true_anomalies),
+  intersect(as.integer(result3_fine1), true_anomalies),
+  intersect(as.integer(result3_fine2), true_anomalies),
+  intersect(as.integer(result3_fine3), true_anomalies)
+)))
+missed_true <- setdiff(true_anomalies, detected_all)
+
+
+time_idx <- seq_along(result)
+plot(time_idx, result, type = "l", lwd = 1.3,
+     xlab = "Time Step", ylab = "Result Value",
+     main = "Time Series with Detected True Anomalies")
+if (length(detected_all)) 
+  points(detected_all, result[detected_all], pch = 19, cex = 0.9, col = "blue")
+if (length(missed_true)) 
+  points(missed_true, result[missed_true], pch = 19, cex = 0.9, col = "red")
+```
+

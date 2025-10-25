@@ -1,0 +1,245 @@
+---
+title: "sensitivity analysis for percentages-DBSCAN"
+author: "Joshua Lu"
+date: "2025-10-19"
+output: html_document
+---
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(isotree)
+
+data_raw <- read.csv("water.csv")
+non_na_mask <- complete.cases(data_raw)
+data <- data_raw[non_na_mask, ]
+event_flag <- data$EVENT
+anomalies <- which(event_flag == TRUE)
+data_no_time <- data[, !(names(data) %in% c("Time", "EVENT"))]
+
+# Coarse-grained model function
+rsc_coarse <- function(data, n_trials = 100, subspace_dim = 5, eps = 0.3, minPts = 4,
+                   trial_top_percent = 0.10, final_top_percent = 0.20, verbose = FALSE) {
+  n <- nrow(data)
+  p <- ncol(data)
+  vote_counts <- rep(0, n)
+  data <- scale(data)
+
+  for (t in 1:n_trials) {
+    selected_features <- sample(1:p, subspace_dim)
+    data_sub <- data[, selected_features, drop = FALSE]
+    set.seed(t)
+    dbscan_result <- tryCatch({
+      dbscan::dbscan(data_sub, eps = eps, minPts = minPts)
+    }, error = function(e) return(NULL))
+    if (is.null(dbscan_result)) next
+    cluster_labels <- dbscan_result$cluster
+    trial_anomalies <- which(cluster_labels == 0)  # select noise points first
+    noise_count <- length(trial_anomalies)
+    threshold <- ceiling(trial_top_percent * n)
+
+    if (noise_count < threshold) {
+      cluster_sizes <- table(cluster_labels[cluster_labels != 0])
+      sorted_clusters <- names(sort(cluster_sizes, decreasing = FALSE))
+      cumulative <- noise_count
+      for (cl in sorted_clusters) {
+        cl_int <- as.integer(cl)
+        members <- which(cluster_labels == cl_int)
+        trial_anomalies <- c(trial_anomalies, members)
+        cumulative <- cumulative + length(members)
+        if (cumulative >= threshold) break
+      }
+    }
+    vote_counts[trial_anomalies] <- vote_counts[trial_anomalies] + 1
+
+    if (verbose && t %% 10 == 0) {
+      cat("Trial", t, "completed\n")
+    }
+  }
+
+  # detect potential anomalies by voting
+  final_top_k <- round(final_top_percent * n)
+  selected_anomalies <- order(vote_counts, decreasing = TRUE)[1:final_top_k]
+  return(selected_anomalies)
+}
+
+# Fine-grained model function
+rsc_fine <- function(data, subset_index, n_trials = 100, subspace_dim = 5, eps = 0.5,
+                     minPts = 5, trial_top_percent = 0.01, 
+                     final_top_k = 1726, verbose = FALSE) {
+  data <- scale(data)
+  n <- length(subset_index)
+  p <- ncol(data)
+  vote_counts <- rep(0, n)  
+  for (t in 1:n_trials) {
+    selected_features <- sample(1:p, subspace_dim)
+    data_sub <- data[subset_index, selected_features, drop = FALSE]
+    set.seed(t)
+    dbscan_result <- tryCatch({
+      dbscan::dbscan(data_sub, eps = eps, minPts = minPts)
+    }, error = function(e) return(NULL))
+    if (is.null(dbscan_result)) next
+    cluster_labels <- dbscan_result$cluster
+    num_points <- length(cluster_labels)
+    is_noise <- cluster_labels == 0
+    noise_indices <- which(is_noise)
+
+    # If the noise is sufficient, use only the noise
+    if (length(noise_indices) >= trial_top_percent * num_points) {
+      selected_indices <- noise_indices
+    } else {
+      # Otherwise, add small clusters until trial_top_percent is achieved
+      cluster_sizes <- table(cluster_labels[cluster_labels != 0])
+      sorted_clusters <- names(sort(cluster_sizes, decreasing = FALSE))
+      cumulative <- length(noise_indices)
+      selected_clusters <- c()
+      for (cl in sorted_clusters) {
+        cumulative <- cumulative + cluster_sizes[cl]
+        selected_clusters <- c(selected_clusters, cl)
+        if (cumulative >= trial_top_percent * num_points) break
+      }
+      cluster_selected_indices <- which(cluster_labels %in% as.integer(selected_clusters))
+      selected_indices <- union(noise_indices, cluster_selected_indices)
+    }
+    vote_counts[selected_indices] <- vote_counts[selected_indices] + 1
+
+    if (verbose && t %% 10 == 0) {
+      cat("Trial", t, "completed\n")
+    }
+  }
+  top_indices <- order(vote_counts, decreasing = TRUE)[1:final_top_k]
+  return(subset_index[top_indices])
+}
+```
+
+
+Integrated two-stage DBSCAN (RSC) function:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+integrated_rsc <- function(data,
+                           true_anomalies,
+                           coarse_trial_top_percent = 0.10,
+                           coarse_final_top_percent = 0.20,
+                           fine_trial_top_percent = 0.01) {
+
+  # ----- Step 1: Coarse-grained model -----
+  coarse_anomalies <- rsc_coarse(
+    data = data,
+    n_trials = 100,
+    subspace_dim = 6,
+    eps = 0.4,
+    minPts = 6,
+    trial_top_percent = coarse_trial_top_percent,
+    final_top_percent = coarse_final_top_percent,
+    verbose = FALSE
+  )
+
+  # ----- Step 2: Fine-grained model -----
+  fine_anomalies <- rsc_fine(
+    data = data,
+    subset_index = coarse_anomalies,
+    n_trials = 100,
+    subspace_dim = 5,
+    eps = 1,
+    minPts = 3,
+    trial_top_percent = fine_trial_top_percent,
+    final_top_k = 1726,
+    verbose = FALSE
+  )
+
+  # ----- Step 3: Compute precision -----
+  tp <- sum(fine_anomalies %in% true_anomalies)
+  precision <- tp / length(fine_anomalies)
+
+  # ----- Step 4: Compute recall for coarse model -----
+  tp_coarse <- sum(coarse_anomalies %in% true_anomalies)
+  recall_coarse <- tp_coarse / length(true_anomalies)
+
+  # ----- Return results -----
+  return(list(
+    coarse_anomalies = coarse_anomalies,
+    fine_anomalies = fine_anomalies,
+    precision = precision,
+    recall_coarse = recall_coarse
+  ))
+}
+```
+
+
+
+sensitivity analysis:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# ====== 1. Coarse model: sensitivity on trial_top_percent ======
+coarse_trial_values <- c(0.01, 0.03, 0.05)
+coarse_trial_results <- list()
+
+for (tp in coarse_trial_values) {
+  cat("Running Coarse trial_top_percent =", tp, "\n")
+  res <- integrated_rsc(
+    data = data_no_time,
+    true_anomalies = anomalies,
+    coarse_trial_top_percent = tp,              # vary trial_top_percent
+    coarse_final_top_percent = 0.10,            # new default
+    fine_trial_top_percent = 0.05               # new default
+  )
+  coarse_trial_results[[as.character(tp)]] <- res
+}
+
+cat("\n--- Coarse Model trial_top_percent Sensitivity ---\n")
+print(coarse_trial_results)
+cat("\n")
+
+# ====== 2. Coarse model: sensitivity on final_top_percent ======
+coarse_final_values <- c(0.05, 0.10, 0.15)
+coarse_final_results <- list()
+
+for (fp in coarse_final_values) {
+  cat("Running Coarse final_top_percent =", fp, "\n")
+  res <- integrated_rsc(
+    data = data_no_time,
+    true_anomalies = anomalies,
+    coarse_trial_top_percent = 0.03,            # new default
+    coarse_final_top_percent = fp,              # vary final_top_percent
+    fine_trial_top_percent = 0.05               # new default
+  )
+  coarse_final_results[[as.character(fp)]] <- res
+}
+
+cat("\n--- Coarse Model final_top_percent Sensitivity ---\n")
+print(coarse_final_results)
+cat("\n")
+
+# ====== 3. Fine model: sensitivity on trial_top_percent ======
+fine_trial_values <- c(0.03, 0.05, 0.10)
+fine_trial_results <- list()
+
+for (tp in fine_trial_values) {
+  cat("Running Fine trial_top_percent =", tp, "\n")
+  res <- integrated_rsc(
+    data = data_no_time,
+    true_anomalies = anomalies,
+    coarse_trial_top_percent = 0.03,            # new default
+    coarse_final_top_percent = 0.10,            # new default
+    fine_trial_top_percent = tp                 # vary fine model parameter
+  )
+  fine_trial_results[[as.character(tp)]] <- res
+}
+
+# ====== 4. Summary table ======
+sensitivity_summary <- data.frame(
+  Setting = c(rep("Coarse trial_top_percent", length(coarse_trial_values)),
+              rep("Coarse final_top_percent", length(coarse_final_values)),
+              rep("Fine trial_top_percent", length(fine_trial_values))),
+  Value = c(coarse_trial_values, coarse_final_values, fine_trial_values),
+  Precision = c(
+    sapply(coarse_trial_results, function(x) x$precision),
+    sapply(coarse_final_results, function(x) x$precision),
+    sapply(fine_trial_results, function(x) x$precision)
+  ),
+  Recall = c(
+    sapply(coarse_trial_results, function(x) x$recall_coarse),
+    sapply(coarse_final_results, function(x) x$recall_coarse),
+    sapply(fine_trial_results, function(x) x$recall_coarse)
+  )
+)
+
+print(sensitivity_summary)
+```
+

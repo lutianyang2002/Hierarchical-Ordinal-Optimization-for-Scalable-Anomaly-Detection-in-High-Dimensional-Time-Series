@@ -1,0 +1,379 @@
+---
+title: "rnn"
+output: html_document
+---
+
+
+Hierarchical model(coarse-grained): 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(torch)
+library(dplyr)
+
+# Coarse-grained model function
+rnn_coarse <- function(hidden_size, lr, dropout_rate, epochs, seq_len, batch_size) {
+  file_path <- "Synthetic_High-Dimensional_Time_Series_Data.csv"
+  time_series_data <- read.csv(file_path)
+  normalize_features <- function(data) {
+    num_features <- ncol(data) - 1 
+    data[, 1:num_features] <- scale(data[, 1:num_features], center = TRUE, scale = TRUE) 
+    return(data)
+  }
+  
+  time_series_data <- normalize_features(time_series_data)
+  features <- as.matrix(time_series_data[, 1:(ncol(time_series_data) - 1)]) 
+  result <- as.numeric(time_series_data$Result) 
+  features_tensor <- torch_tensor(features, dtype = torch_float())
+  result_tensor <- torch_tensor(result, dtype = torch_float())
+  count <- rep(0, nrow(features))
+  
+  rrnn_model <- nn_module(
+    "RRNN_Model",
+    
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])
+      out <- self$fc(out)
+      out
+    }
+  )
+  
+  for (i in 1:200) {
+    set.seed(i)    
+    torch_manual_seed(i) 
+    
+    model <- rrnn_model(ncol(features), hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+    
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+      loss <- criterion(outputs$squeeze(), result_tensor)
+      loss$backward()
+      optimizer$step()
+    }
+    
+    model$eval()
+    predictions <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+    predictions <- as.numeric(predictions$squeeze())
+    error_scores <- abs(result - predictions)
+    threshold <- quantile(error_scores, 0.95)
+    detected_anomalies <- which(error_scores > threshold)
+    count[detected_anomalies] <- count[detected_anomalies] + 1
+  }
+  
+  top_10_percent <- round(nrow(features) * 0.1)
+  final_anomalies <- order(count, decreasing = TRUE)[1:top_10_percent]
+  
+  return(final_anomalies)
+}
+
+
+# Coarse-grained model 1
+hidden_size <- 48
+lr <- 0.020
+dropout_rate <- 0.26
+epochs <- 50
+time_rrnn1 <- system.time({
+  res_rrnn1 <- rnn_coarse(hidden_size = hidden_size, lr = lr, dropout_rate = dropout_rate, epochs = epochs)
+})
+cat("RRNN Run 1 elapsed (s):", time_rrnn1["elapsed"], "\n")
+print(res_rrnn1)
+# RRNN Run 1 elapsed (s): 51.64 
+
+# Coarse-grained model 2
+hidden_size <- 50
+lr <- 0.022
+dropout_rate <- 0.25
+epochs <- 50
+time_rrnn2 <- system.time({
+  res_rrnn2 <- rnn_coarse(hidden_size = hidden_size, lr = lr, dropout_rate = dropout_rate, epochs = epochs)
+})
+cat("RRNN Run 2 elapsed (s):", time_rrnn2["elapsed"], "\n")
+print(res_rrnn2)
+# RRNN Run 2 elapsed (s): 54.86 
+
+# Coarse-grained model 3
+hidden_size <- 55
+lr <- 0.018
+dropout_rate <- 0.25
+epochs <- 50
+time_rrnn3 <- system.time({
+  res_rrnn3 <- rnn_coarse(hidden_size = hidden_size, lr = lr, dropout_rate = dropout_rate, epochs = epochs)
+})
+cat("RRNN Run 3 elapsed (s):", time_rrnn3["elapsed"], "\n")
+print(res_rrnn3)
+# RRNN Run 3 elapsed (s): 56.26 
+```
+
+
+
+Hierarchical model(fine-grained): 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(torch)
+library(dplyr)
+
+# Fine-grained model function
+rnn_fine <- function(hidden_size, lr, dropout_rate, epochs, seq_len, batch_size, count) {
+  file_path <- "Synthetic_High-Dimensional_Time_Series_Data.csv"
+  data <- read.csv(file_path)
+  features <- as.matrix(data[, 1:(ncol(data) - 1)])  
+  result <- as.numeric(data$Result)  
+  features <- scale(features)
+  features_tensor <- torch_tensor(features, dtype = torch_float())
+  result_tensor <- torch_tensor(result, dtype = torch_float())
+  count_votes <- rep(0, length(count))  
+  names(count_votes) <- count  
+
+  rrnn_fine_model <- nn_module(
+    "RRNN_Fine_Model",
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])
+      out <- self$fc(out)
+      out
+    }
+  )
+
+  num_experiments <- 200
+  for (i in 1:num_experiments) {
+    set.seed(i) 
+    torch_manual_seed(i) 
+    
+    model <- rrnn_fine_model(ncol(features), hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+    
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+      loss <- criterion(outputs$squeeze(), result_tensor)
+      loss$backward()
+      optimizer$step()
+    }
+
+    model$eval()
+    predictions <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+    predictions <- as.numeric(predictions$squeeze())
+    error_scores <- abs(result - predictions)
+    fine_anomalies_scores <- error_scores[count]
+    threshold <- quantile(fine_anomalies_scores, 0.95)
+    detected_fine_anomalies <- count[fine_anomalies_scores > threshold]
+    
+    count_votes[as.character(detected_fine_anomalies)] <- count_votes[as.character(detected_fine_anomalies)] + 1
+  }
+
+  final_fine_anomalies <- names(sort(count_votes, decreasing = TRUE))
+
+  cat("Final Ranked Anomalies Based on 100 Runs Voting:\n")  
+  return(final_fine_anomalies[1:10])
+}
+
+# Coarse-grained model results
+count1 <- c(92, 44, 196, 159, 149, 29, 164, 11, 127, 88, 118, 122, 163, 58, 175, 5, 160, 150, 156, 195)
+count2 <- c(92, 44, 159, 196, 149, 29, 164, 127, 11, 122, 88, 118, 43, 58, 150, 152, 163, 32, 72, 119)
+count3 <- c(92, 44, 159, 196, 149, 29, 164, 88, 11, 118, 122, 127, 9, 32, 200, 26, 5, 137, 146, 156)
+
+# Fine-grained model 1
+time_fine1_1 <- system.time({
+  res_fine1_1 <- rnn_fine(120, 0.0015, 0.03, 250, seq_len = 8, batch_size = 64, count1)
+})
+cat("fine1_1 elapsed (s):", time_fine1_1["elapsed"], "\n")
+print(res_fine1_1)
+# fine1_1 elapsed (s): 303.61
+
+time_fine1_2 <- system.time({
+  res_fine1_2 <- rnn_fine(130, 0.0013, 0.02, 270, seq_len = 8, batch_size = 96, count1)
+})
+cat("fine1_2 elapsed (s):", time_fine1_2["elapsed"], "\n")
+print(res_fine1_2)
+# fine1_2 elapsed (s): 309.52
+
+time_fine1_3 <- system.time({
+  res_fine1_3 <- rnn_fine(140, 0.0012, 0.01, 300, seq_len = 8, batch_size = 128, count1)
+})
+cat("fine1_3 elapsed (s):", time_fine1_3["elapsed"], "\n")
+print(res_fine1_3)
+# fine1_3 elapsed (s): 350.97
+
+# Fine-grained model 2
+time_fine2_1 <- system.time({
+  res_fine2_1 <- rnn_fine(120, 0.0015, 0.03, 250, seq_len = 8, batch_size = 64, count2)
+})
+cat("fine2_1 elapsed (s):", time_fine2_1["elapsed"], "\n")
+print(res_fine2_1)
+# fine2_1 elapsed (s): 284.2
+
+time_fine2_2 <- system.time({
+  res_fine2_2 <- rnn_fine(130, 0.0013, 0.02, 270, seq_len = 8, batch_size = 96, count2)
+})
+cat("fine2_2 elapsed (s):", time_fine2_2["elapsed"], "\n")
+print(res_fine2_2)
+# fine2_2 elapsed (s): 356.67
+
+time_fine2_3 <- system.time({
+  res_fine2_3 <- rnn_fine(140, 0.0012, 0.01, 300, seq_len = 8, batch_size = 128, count2)
+})
+cat("fine2_3 elapsed (s):", time_fine2_3["elapsed"], "\n")
+print(res_fine2_3)
+# fine2_3 elapsed (s): 1061.92
+
+# Fine-grained model 3
+time_fine3_1 <- system.time({
+  res_fine3_1 <- rnn_fine(120, 0.0015, 0.03, 250, seq_len = 8, batch_size = 64, count3)
+})
+cat("fine3_1 elapsed (s):", time_fine3_1["elapsed"], "\n")
+print(res_fine3_1)
+# fine3_1 elapsed (s): 1056.64 
+
+time_fine3_2 <- system.time({
+  res_fine3_2 <- rnn_fine(130, 0.0013, 0.02, 270, seq_len = 8, batch_size = 96, count3)
+})
+cat("fine3_2 elapsed (s):", time_fine3_2["elapsed"], "\n")
+print(res_fine3_2)
+# fine3_2 elapsed (s): 1266.64 
+
+time_fine3_3 <- system.time({
+  res_fine3_3 <- rnn_fine(140, 0.0012, 0.01, 300, seq_len = 8, batch_size = 128, count3)
+})
+cat("fine3_3 elapsed (s):", time_fine3_3["elapsed"], "\n")
+print(res_fine3_3)
+# fine3_3 elapsed (s): 1401.78
+```
+
+
+
+
+Conventional model:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(torch)
+library(dplyr)
+
+data <- read.csv("Synthetic_High-Dimensional_Time_Series_Data.csv")
+features <- as.matrix(data[, 1:(ncol(data) - 1)])
+result <- as.numeric(data$Result)
+features <- scale(features)
+features_tensor <- torch_tensor(features, dtype = torch_float())
+result_tensor <- torch_tensor(result, dtype = torch_float())
+
+# Conventional model function
+rnn_conventional <- function(hidden_size, lr, dropout_rate, epochs, batch_size, 
+                                      vote_rounds = 100) {
+  vote_count <- rep(0, nrow(features))
+  true_anomalies <- c(8, 92, 122, 127, 130, 149, 150, 159, 164, 196)
+
+  RNN_Model <- nn_module(
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])
+      out <- self$fc(out)
+      out
+    }
+  )
+
+  for (r in 1:vote_rounds) {
+    set.seed(r)
+    torch_manual_seed(r)
+
+    model <- RNN_Model(ncol(features), hidden_size, 1)
+    opt <- optim_adam(model$parameters, lr = lr)
+    loss_fn <- nn_mse_loss()
+
+    for (epoch in 1:epochs) {
+      model$train()
+      opt$zero_grad()
+      pred <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+      loss <- loss_fn(pred$squeeze(), result_tensor)
+      loss$backward()
+      opt$step()
+    }
+
+    model$eval()
+    pred <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+    pred_values <- as.numeric(pred$squeeze())
+    errors <- abs(result - pred_values)
+
+    top10 <- order(errors, decreasing = TRUE)[1:10]
+    vote_count[top10] <- vote_count[top10] + 1
+  }
+
+  final_anomalies <- order(vote_count, decreasing = TRUE)[1:10]
+  tp <- sum(final_anomalies %in% true_anomalies)
+  fp <- length(final_anomalies) - tp
+  precision <- tp / (tp + fp)
+  cat("Final Detected Anomalies:", sort(final_anomalies), "\n")
+  cat("Precision =", round(precision, 4), "\n")
+
+  return(round(precision, 4))
+}
+
+
+# Conventional model 1
+cat("\n===== Running Middle Model Set 1 =====\n")
+time_mid1 <- system.time({
+  res_mid1 <- rnn_conventional(
+    hidden_size = 75,
+    lr = 0.006,
+    dropout_rate = 0.15,
+    epochs = 150,
+    batch_size = 80,
+    vote_rounds = 100
+  )
+})
+cat("Middle Model Set 1 elapsed (s):", time_mid1["elapsed"], "\n")
+print(res_mid1)
+# Middle Model Set 1 elapsed (s): 221.69 
+
+# Conventional model 2
+cat("\n===== Running Middle Model Set 2 =====\n")
+time_mid2 <- system.time({
+  res_mid2 <- rnn_conventional(
+    hidden_size = 85,
+    lr = 0.0045,
+    dropout_rate = 0.12,
+    epochs = 200,
+    batch_size = 96,
+    vote_rounds = 100
+  )
+})
+cat("Middle Model Set 2 elapsed (s):", time_mid2["elapsed"], "\n")
+print(res_mid2)
+# Middle Model Set 2 elapsed (s): 309.71
+
+# Conventional model 3
+cat("\n===== Running Middle Model Set 3 =====\n")
+time_mid3 <- system.time({
+  res_mid3 <- rnn_conventional(
+    hidden_size = 90,
+    lr = 0.004,
+    dropout_rate = 0.08,
+    epochs = 220,
+    batch_size = 112,
+    vote_rounds = 100
+  )
+})
+cat("Middle Model Set 3 elapsed (s):", time_mid3["elapsed"], "\n")
+print(res_mid3)
+# Middle Model Set 3 elapsed (s): 341.74 
+```
+
+

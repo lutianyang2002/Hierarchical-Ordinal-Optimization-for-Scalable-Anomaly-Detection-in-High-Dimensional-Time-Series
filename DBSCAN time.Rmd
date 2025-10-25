@@ -1,0 +1,491 @@
+---
+title: "DBSCAN time"
+output: html_document
+---
+
+
+Conventional model:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(dbscan)
+
+data_raw <- read.csv("water.csv")
+data <- data_raw[complete.cases(data_raw), ]
+anomalies <- which(data$EVENT == TRUE)
+data_no_time <- data[, !(names(data) %in% c("Time", "EVENT"))]
+
+# conventional model function
+rsc_conventional <- function(data,
+                             n_trials = 100,
+                             subspace_dim = 6,
+                             eps = 0.4,
+                             minPts = 6,
+                             final_top_k = 1726,
+                             trial_top_percent = 0.01,
+                             verbose = FALSE) {
+  n <- nrow(data)
+  p <- ncol(data)
+  vote_counts <- rep(0, n)
+  data <- scale(data) 
+
+  for (t in 1:n_trials) {
+    selected_features <- sample(1:p, subspace_dim)
+    data_sub <- data[, selected_features, drop = FALSE]
+
+    set.seed(t)
+    dbscan_result <- tryCatch({
+      dbscan::dbscan(data_sub, eps = eps, minPts = minPts)
+    }, error = function(e) return(NULL))
+
+    if (is.null(dbscan_result)) next
+
+    cluster_labels <- dbscan_result$cluster
+    cluster_sizes <- table(cluster_labels[cluster_labels != 0])
+    sorted_clusters <- names(sort(cluster_sizes, decreasing = FALSE))
+
+    cumulative <- 0
+    selected_clusters <- c()
+    for (cl in sorted_clusters) {
+      cumulative <- cumulative + cluster_sizes[cl]
+      selected_clusters <- c(selected_clusters, cl)
+      if (cumulative >= trial_top_percent * n) break
+    }
+
+    trial_anomalies <- which(cluster_labels == 0 | cluster_labels %in% as.integer(selected_clusters))
+    vote_counts[trial_anomalies] <- vote_counts[trial_anomalies] + 1
+
+    if (verbose && t %% 10 == 0) {
+      cat("Trial", t, "completed\n")
+    }
+  }
+
+  top_k <- order(vote_counts, decreasing = TRUE)[1:final_top_k]
+  return(top_k)
+}
+
+# Ground truth
+true_anomalies <- anomalies
+
+# conventional model 1
+time_trad_dbscan1 <- system.time({
+  result1 <- rsc_conventional(
+    data_no_time,
+    n_trials = 100,
+    subspace_dim = 3,
+    eps = 0.3,
+    minPts = 3,
+    final_top_k = 1726
+  )
+})
+recall1 <- length(intersect(result1, true_anomalies)) / length(true_anomalies)
+precision1 <- length(intersect(result1, true_anomalies)) / 1726
+cat("Model 1 - Recall:", round(recall1, 4),
+    "Precision:", round(precision1, 4),
+    "| Time(s):", time_trad_dbscan1["elapsed"], "\n")
+# Model 1 - Recall: 0.3882 Precision: 0.3882 | Time(s): 425.08 
+
+# conventional model 2
+time_trad_dbscan2 <- system.time({
+  result2 <- rsc_conventional(
+    data_no_time,
+    n_trials = 100,
+    subspace_dim = 4,
+    eps = 0.5,
+    minPts = 4,
+    final_top_k = 1726
+  )
+})
+recall2 <- length(intersect(result2, true_anomalies)) / length(true_anomalies)
+precision2 <- length(intersect(result2, true_anomalies)) / 1726
+cat("Model 2 - Recall:", round(recall2, 4),
+    "Precision:", round(precision2, 4),
+    "| Time(s):", time_trad_dbscan2["elapsed"], "\n")
+# Model 2 - Recall: 0.3922 Precision: 0.3922 | Time(s): 1810.16
+
+# conventional model 3
+time_trad_dbscan3 <- system.time({
+  result3 <- rsc_conventional(
+    data_no_time,
+    n_trials = 100,
+    subspace_dim = 5,
+    eps = 0.7,
+    minPts = 5,
+    final_top_k = 1726
+  )
+})
+recall3 <- length(intersect(result3, true_anomalies)) / length(true_anomalies)
+precision3 <- length(intersect(result3, true_anomalies)) / 1726
+cat("Model 3 - Recall:", round(recall3, 4),
+    "Precision:", round(precision3, 4),
+    "| Time(s):", time_trad_dbscan3["elapsed"], "\n")
+# Model 3 - Recall: 0.4647 Precision: 0.4647 | Time(s): 3269.72
+```
+
+
+
+
+
+Hierarchical model(coarse-grained): 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(isotree)
+library(dbscan)
+
+data_raw <- read.csv("water.csv")
+non_na_mask <- complete.cases(data_raw)
+data <- data_raw[non_na_mask, ]
+event_flag <- data$EVENT
+anomalies <- which(event_flag == TRUE)
+data_no_time <- data[, !(names(data) %in% c("Time", "EVENT"))]
+
+# Coarse-grained model function
+rsc_coarse <- function(data, 
+                       n_trials = 100,
+                       subspace_dim = 5,
+                       eps = 0.3,
+                       minPts = 4,
+                       trial_top_percent = 0.10,
+                       final_top_percent = 0.20,
+                       verbose = FALSE) {
+  n <- nrow(data)
+  p <- ncol(data)
+  vote_counts <- rep(0, n)
+  data <- scale(data)
+
+  for (t in 1:n_trials) {
+    selected_features <- sample(1:p, subspace_dim)
+    data_sub <- data[, selected_features, drop = FALSE]
+
+    set.seed(t)
+    dbscan_result <- tryCatch({
+      dbscan::dbscan(data_sub, eps = eps, minPts = minPts)
+    }, error = function(e) return(NULL))
+    if (is.null(dbscan_result)) next
+
+    cluster_labels <- dbscan_result$cluster
+    trial_anomalies <- which(cluster_labels == 0) 
+
+    noise_count <- length(trial_anomalies)
+    threshold <- ceiling(trial_top_percent * n)
+
+    if (noise_count < threshold) {
+      cluster_sizes <- table(cluster_labels[cluster_labels != 0])
+      sorted_clusters <- names(sort(cluster_sizes, decreasing = FALSE))
+
+      cumulative <- noise_count
+      for (cl in sorted_clusters) {
+        cl_int <- as.integer(cl)
+        members <- which(cluster_labels == cl_int)
+        trial_anomalies <- c(trial_anomalies, members)
+        cumulative <- cumulative + length(members)
+        if (cumulative >= threshold) break
+      }
+    }
+
+    vote_counts[trial_anomalies] <- vote_counts[trial_anomalies] + 1
+
+    if (verbose && t %% 10 == 0) {
+      cat("Trial", t, "completed\n")
+    }
+  }
+
+  final_top_k <- round(final_top_percent * n)
+  selected_anomalies <- order(vote_counts, decreasing = TRUE)[1:final_top_k]
+
+  return(selected_anomalies)
+}
+
+# Coarse-grained model 1
+time_coarse_rsc1 <- system.time({
+  result1 <- rsc_coarse(
+    data = data_no_time,
+    n_trials = 100,
+    subspace_dim = 5,
+    eps = 0.3,
+    minPts = 4,
+    trial_top_percent = 0.03,
+    final_top_percent = 0.10,
+    verbose = FALSE
+  )
+})
+recall1 <- length(intersect(result1, anomalies)) / length(anomalies)
+precision1 <- length(intersect(result1, anomalies)) / length(result1)
+cat("result1 - Recall:", round(recall1, 4), 
+    "Precision:", round(precision1, 4), 
+    "| Time(s):", time_coarse_rsc1["elapsed"], "\n")
+# result1 - Recall: 0.9751 Precision: 0.1215
+# result1 - Recall: 0.9751 Precision: 0.1215 | Time(s): 606.01
+
+# Coarse-grained model 2
+time_coarse_rsc2 <- system.time({
+  result2 <- rsc_coarse(
+    data = data_no_time,
+    n_trials = 100,
+    subspace_dim = 6,
+    eps = 0.4,
+    minPts = 6,
+    trial_top_percent = 0.03,
+    final_top_percent = 0.10,
+    verbose = FALSE
+  )
+})
+recall2 <- length(intersect(result2, anomalies)) / length(anomalies)
+precision2 <- length(intersect(result2, anomalies)) / length(result2)
+cat("result2 - Recall:", round(recall2, 4), 
+    "Precision:", round(precision2, 4), 
+    "| Time(s):", time_coarse_rsc2["elapsed"], "\n")
+# result2 - Recall: 0.9728 Precision: 0.1212
+# result2 - Recall: 0.9728 Precision: 0.1212 | Time(s): 962.73
+
+# Coarse-grained model 3
+time_coarse_rsc3 <- system.time({
+  result3 <- rsc_coarse(
+    data = data_no_time,
+    n_trials = 100,
+    subspace_dim = 6,
+    eps = 0.45,
+    minPts = 5,
+    trial_top_percent = 0.03,
+    final_top_percent = 0.10,
+    verbose = FALSE
+  )
+})
+recall3 <- length(intersect(result3, anomalies)) / length(anomalies)
+precision3 <- length(intersect(result3, anomalies)) / length(result3)
+cat("result3 - Recall:", round(recall3, 4), 
+    "Precision:", round(precision3, 4), 
+    "| Time(s):", time_coarse_rsc3["elapsed"], "\n")
+# result3 - Recall: 0.9502 Precision: 0.1184
+# result3 - Recall: 0.9502 Precision: 0.1184 | Time(s): 400.03 
+```
+
+
+
+
+
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+rsc_fine <- function(data,
+                     subset_index,
+                     n_trials = 100,
+                     subspace_dim = 5,
+                     eps = 0.5,
+                     minPts = 5,
+                     trial_top_percent = 0.01,
+                     final_top_k = 1726,
+                     verbose = FALSE) {
+  data <- scale(data)
+  n <- length(subset_index)
+  p <- ncol(data)
+  vote_counts <- rep(0, n)
+
+  for (t in 1:n_trials) {
+    selected_features <- sample(1:p, subspace_dim)
+    data_sub <- data[subset_index, selected_features, drop = FALSE]
+
+    set.seed(t)
+    dbscan_result <- tryCatch({
+      dbscan::dbscan(data_sub, eps = eps, minPts = minPts)
+    }, error = function(e) return(NULL))
+    if (is.null(dbscan_result)) next
+
+    cluster_labels <- dbscan_result$cluster
+    num_points <- length(cluster_labels)
+    is_noise <- cluster_labels == 0
+    noise_indices <- which(is_noise)
+
+    if (length(noise_indices) >= trial_top_percent * num_points) {
+      selected_indices <- noise_indices
+    } else {
+      cluster_sizes <- table(cluster_labels[cluster_labels != 0])
+      sorted_clusters <- names(sort(cluster_sizes, decreasing = FALSE))
+      cumulative <- length(noise_indices)
+      selected_clusters <- c()
+
+      for (cl in sorted_clusters) {
+        cumulative <- cumulative + cluster_sizes[cl]
+        selected_clusters <- c(selected_clusters, cl)
+        if (cumulative >= trial_top_percent * num_points) break
+      }
+
+      cluster_selected_indices <- which(cluster_labels %in% as.integer(selected_clusters))
+      selected_indices <- union(noise_indices, cluster_selected_indices)
+    }
+
+    vote_counts[selected_indices] <- vote_counts[selected_indices] + 1
+
+    if (verbose && t %% 10 == 0) {
+      cat("Trial", t, "completed\n")
+    }
+  }
+
+  top_indices <- order(vote_counts, decreasing = TRUE)[1:final_top_k]
+  return(subset_index[top_indices])
+}
+
+# Fine-grained model 1
+time_fine1_1 <- system.time({
+  fine1_1 <- rsc_fine(
+    data = data_no_time,
+    subset_index = result1,
+    n_trials = 100,
+    subspace_dim = 3,
+    eps = 0.3,
+    minPts = 2,
+    trial_top_percent = 0.05
+  )
+})
+recall1_1 <- length(intersect(fine1_1, anomalies)) / length(fine1_1)
+precision1_1 <- recall1_1
+cat("result1_1 - Recall:", round(recall1_1, 4), 
+    "Precision:", round(precision1_1, 4),
+    "| Time(s):", time_fine1_1["elapsed"], "\n")
+# result1_1 - Recall: 0.6402 Precision: 0.6402 | Time(s): 3.64 
+
+time_fine2_1 <- system.time({
+  fine2_1 <- rsc_fine(
+    data = data_no_time,
+    subset_index = result2,
+    n_trials = 100,
+    subspace_dim = 3,
+    eps = 0.3,
+    minPts = 2,
+    trial_top_percent = 0.05
+  )
+})
+recall2_1 <- length(intersect(fine2_1, anomalies)) / length(fine2_1)
+precision2_1 <- recall2_1
+cat("result2_1 - Recall:", round(recall2_1, 4),
+    "Precision:", round(precision2_1, 4),
+    "| Time(s):", time_fine2_1["elapsed"], "\n")
+# result2_1 - Recall: 0.6454 Precision: 0.6454 | Time(s): 8.07 
+
+time_fine3_1 <- system.time({
+  fine3_1 <- rsc_fine(
+    data = data_no_time,
+    subset_index = result3,
+    n_trials = 100,
+    subspace_dim = 3,
+    eps = 0.3,
+    minPts = 2,
+    trial_top_percent = 0.05
+  )
+})
+recall3_1 <- length(intersect(fine3_1, anomalies)) / length(fine3_1)
+precision3_1 <- recall3_1
+cat("result3_1 - Recall:", round(recall3_1, 4),
+    "Precision:", round(precision3_1, 4),
+    "| Time(s):", time_fine3_1["elapsed"], "\n")
+# result3_1 - Recall: 0.6234 Precision: 0.6234 | Time(s): 21.92
+
+
+# Fine-grained model 2
+time_fine1_2 <- system.time({
+  fine1_2 <- rsc_fine(
+    data = data_no_time,
+    subset_index = result1,
+    n_trials = 100,
+    subspace_dim = 5,
+    eps = 1,
+    minPts = 3,
+    trial_top_percent = 0.05
+  )
+})
+recall1_2 <- length(intersect(fine1_2, anomalies)) / length(fine1_2)
+precision1_2 <- recall1_2
+cat("result1_2 - Recall:", round(recall1_2, 4),
+    "Precision:", round(precision1_2, 4),
+    "| Time(s):", time_fine1_2["elapsed"], "\n")
+# result1_2 - Recall: 0.6437 Precision: 0.6437 | Time(s): 42.74
+
+time_fine2_2 <- system.time({
+  fine2_2 <- rsc_fine(
+    data = data_no_time,
+    subset_index = result2,
+    n_trials = 100,
+    subspace_dim = 5,
+    eps = 1,
+    minPts = 3,
+    trial_top_percent = 0.05
+  )
+})
+recall2_2 <- length(intersect(fine2_2, anomalies)) / length(fine2_2)
+precision2_2 <- recall2_2
+cat("result2_2 - Recall:", round(recall2_2, 4),
+    "Precision:", round(precision2_2, 4),
+    "| Time(s):", time_fine2_2["elapsed"], "\n")
+# result2_2 - Recall: 0.6587 Precision: 0.6587 | Time(s): 106.61
+
+time_fine3_2 <- system.time({
+  fine3_2 <- rsc_fine(
+    data = data_no_time,
+    subset_index = result3,
+    n_trials = 100,
+    subspace_dim = 5,
+    eps = 1,
+    minPts = 3,
+    trial_top_percent = 0.05
+  )
+})
+recall3_2 <- length(intersect(fine3_2, anomalies)) / length(fine3_2)
+precision3_2 <- recall3_2
+cat("result3_2 - Recall:", round(recall3_2, 4),
+    "Precision:", round(precision3_2, 4),
+    "| Time(s):", time_fine3_2["elapsed"], "\n")
+# result3_2 - Recall: 0.6327 Precision: 0.6327 | Time(s): 112.42 
+
+
+# Fine-grained model 3
+time_fine1_3 <- system.time({
+  fine1_3 <- rsc_fine(
+    data = data_no_time,
+    subset_index = result1,
+    n_trials = 100,
+    subspace_dim = 2,
+    eps = 0.7,
+    minPts = 2,
+    trial_top_percent = 0.05
+  )
+})
+recall1_3 <- length(intersect(fine1_3, anomalies)) / length(fine1_3)
+precision1_3 <- recall1_3
+cat("result1_3 - Recall:", round(recall1_3, 4),
+    "Precision:", round(precision1_3, 4),
+    "| Time(s):", time_fine1_3["elapsed"], "\n")
+# result1_3 - Recall: 0.5718 Precision: 0.5718 | Time(s): 107.3 
+
+time_fine2_3 <- system.time({
+  fine2_3 <- rsc_fine(
+    data = data_no_time,
+    subset_index = result2,
+    n_trials = 100,
+    subspace_dim = 2,
+    eps = 0.7,
+    minPts = 2,
+    trial_top_percent = 0.05
+  )
+})
+recall2_3 <- length(intersect(fine2_3, anomalies)) / length(fine2_3)
+precision2_3 <- recall2_3
+cat("result2_3 - Recall:", round(recall2_3, 4),
+    "Precision:", round(precision2_3, 4),
+    "| Time(s):", time_fine2_3["elapsed"], "\n")
+# result2_3 - Recall: 0.5574 Precision: 0.5574 | Time(s): 50.66 
+
+time_fine3_3 <- system.time({
+  fine3_3 <- rsc_fine(
+    data = data_no_time,
+    subset_index = result3,
+    n_trials = 100,
+    subspace_dim = 2,
+    eps = 0.7,
+    minPts = 2,
+    trial_top_percent = 0.05
+  )
+})
+recall3_3 <- length(intersect(fine3_3, anomalies)) / length(fine3_3)
+precision3_3 <- recall3_3
+cat("result3_3 - Recall:", round(recall3_3, 4),
+    "Precision:", round(precision3_3, 4),
+    "| Time(s):", time_fine3_3["elapsed"], "\n")
+# result3_3 - Recall: 0.5765 Precision: 0.5765 | Time(s): 26.24 
+```
+

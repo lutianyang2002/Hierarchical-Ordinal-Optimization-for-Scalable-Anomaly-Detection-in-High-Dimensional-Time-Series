@@ -1,0 +1,347 @@
+---
+title: "particle time"
+output: html_document
+---
+
+Hierarchical model(coarse-grained): 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Coarse-grained model function
+pf_coarse <- function(num_particles, sigma_process, sigma_measure, threshold_percentile, num_trials) {
+  file_path <- "Synthetic_High-Dimensional_Time_Series_Data.csv"
+  time_series_data <- read.csv(file_path)
+  result <- as.numeric(time_series_data$Result)
+  anomaly_scores <- rep(0, length(result))
+  for (trial in 1:num_trials) {
+    particles <- rnorm(num_particles, mean = result[1], sd = sigma_process)
+    weights <- rep(1 / num_particles, num_particles)
+    
+    for (t in 2:length(result)) {
+      particles <- particles + rnorm(num_particles, mean = 0, sd = sigma_process)
+      likelihood <- dnorm(result[t], mean = particles, sd = sigma_measure)
+      weights <- weights * likelihood
+      weights <- weights / sum(weights)
+      estimate <- sum(particles * weights)
+      anomaly_scores[t] <- anomaly_scores[t] + abs(result[t] - estimate)
+      indices <- sample(1:num_particles, size = num_particles, replace = TRUE, prob = weights)
+      particles <- particles[indices]
+      weights <- rep(1 / num_particles, num_particles)
+    }
+  }
+
+  anomaly_scores <- anomaly_scores / num_trials
+  threshold <- quantile(anomaly_scores, probs = threshold_percentile / 100)
+  top_k <- round(0.1 * length(result))
+  return(order(anomaly_scores, decreasing = TRUE)[1:top_k])
+}
+
+
+
+# Coarse-grained model 1
+num_particles <- 3500
+sigma_process <- 0.55
+sigma_measure <- 0.65
+threshold_percentile <- 80
+num_trials <- 100
+
+time_pf1 <- system.time({
+  res_pf1 <- pf_coarse(
+    num_particles = num_particles,
+    sigma_process = sigma_process,
+    sigma_measure = sigma_measure,
+    threshold_percentile = threshold_percentile,
+    num_trials = num_trials
+  )
+})
+cat("PF Model 1 elapsed (s):", time_pf1["elapsed"], "\n")
+print(res_pf1)
+# PF Model 1 elapsed (s): 17.93
+
+# Coarse-grained model 2
+num_particles <- 4000
+sigma_process <- 0.50
+sigma_measure <- 0.68
+threshold_percentile <- 80
+num_trials <- 100
+
+time_pf2 <- system.time({
+  res_pf2 <- pf_coarse(
+    num_particles = num_particles,
+    sigma_process = sigma_process,
+    sigma_measure = sigma_measure,
+    threshold_percentile = threshold_percentile,
+    num_trials = num_trials
+  )
+})
+cat("PF Model 2 elapsed (s):", time_pf2["elapsed"], "\n")
+print(res_pf2)
+# PF Model 2 elapsed (s): 19.99 
+
+# Coarse-grained model 3
+num_particles <- 4500
+sigma_process <- 0.48
+sigma_measure <- 0.70
+threshold_percentile <- 80
+num_trials <- 100
+
+time_pf3 <- system.time({
+  res_pf3 <- pf_coarse(
+    num_particles = num_particles,
+    sigma_process = sigma_process,
+    sigma_measure = sigma_measure,
+    threshold_percentile = threshold_percentile,
+    num_trials = num_trials
+  )
+})
+cat("PF Model 3 elapsed (s):", time_pf3["elapsed"], "\n")
+print(res_pf3)
+# PF Model 3 elapsed (s): 23.7 
+```
+
+
+
+Hierarchical model(fine-grained): 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Coarse-grained model results
+count1 <- c(149, 92, 2, 127, 196, 153, 66, 8, 64, 59, 
+            159, 199, 22, 183, 77, 29, 172, 114, 122, 128)
+count2 <- c(149, 92, 2, 127, 196, 153, 66, 8, 64, 159, 
+            59, 199, 183, 22, 29, 77, 122, 172, 200, 114)
+count3 <- c(149, 92, 2, 127, 196, 153, 66, 8, 64, 159, 
+            59, 199, 183, 29, 22, 77, 122, 172, 200, 15)
+
+# Fine-grained model function
+pf_fine <- function(num_particles, sigma_process, sigma_measure, threshold_percentile, num_trials, count) {
+  file_path <- "Synthetic_High-Dimensional_Time_Series_Data.csv"
+  time_series_data <- read.csv(file_path)
+  result <- as.numeric(time_series_data$Result)
+  anomaly_scores <- rep(0, length(result))
+
+  for (trial in 1:num_trials) {
+    particles <- rnorm(num_particles, mean = result[1], sd = sigma_process)
+    weights <- rep(1 / num_particles, num_particles)
+    
+    for (t in 2:length(result)) {
+      particles <- particles + rnorm(num_particles, mean = 0, sd = sigma_process)
+      likelihood <- dnorm(result[t], mean = particles, sd = sigma_measure)
+      weights <- weights * likelihood
+      weights <- weights / sum(weights)
+      estimate <- sum(particles * weights)
+      if (t %in% count) {
+        anomaly_scores[t] <- anomaly_scores[t] + abs(result[t] - estimate)
+      }
+      
+      indices <- sample(1:num_particles, size = num_particles, replace = TRUE, prob = weights)
+      particles <- particles[indices]
+      weights <- rep(1 / num_particles, num_particles)
+    }
+  }
+  
+  anomaly_scores <- anomaly_scores / num_trials
+  filtered_scores <- anomaly_scores[count]
+  top_indices <- order(filtered_scores, decreasing = TRUE)[1:10]
+  
+  return(count[top_indices])
+}
+
+
+
+# Fine-grained model 1
+num_particles <- 9500
+sigma_process <- 0.45
+sigma_measure <- 0.88
+threshold_percentile <- 90
+num_trials <- 1000
+
+time_fine_pf1_1 <- system.time({
+  res_fine_pf1_1 <- pf_fine(
+    num_particles, sigma_process, sigma_measure,
+    threshold_percentile, num_trials, count1
+  )
+})
+cat("Fine PF 1-1 elapsed (s):", time_fine_pf1_1["elapsed"], "\n")
+print(res_fine_pf1_1)
+# Fine PF 1-1 elapsed (s): 440.31 
+
+time_fine_pf2_1 <- system.time({
+  res_fine_pf2_1 <- pf_fine(
+    num_particles, sigma_process, sigma_measure,
+    threshold_percentile, num_trials, count2
+  )
+})
+cat("Fine PF 2-1 elapsed (s):", time_fine_pf2_1["elapsed"], "\n")
+print(res_fine_pf2_1)
+# Fine PF 2-1 elapsed (s): 437.57 
+
+time_fine_pf3_1 <- system.time({
+  res_fine_pf3_1 <- pf_fine(
+    num_particles, sigma_process, sigma_measure,
+    threshold_percentile, num_trials, count3
+  )
+})
+cat("Fine PF 3-1 elapsed (s):", time_fine_pf3_1["elapsed"], "\n")
+print(res_fine_pf3_1)
+# Fine PF 3-1 elapsed (s): 427.81 
+
+
+# Fine-grained model 2
+num_particles <- 10000
+sigma_process <- 0.40
+sigma_measure <- 0.90
+threshold_percentile <- 90
+num_trials <- 1000
+
+time_fine_pf1_2 <- system.time({
+  res_fine_pf1_2 <- pf_fine(
+    num_particles, sigma_process, sigma_measure,
+    threshold_percentile, num_trials, count1
+  )
+})
+cat("Fine PF 1-2 elapsed (s):", time_fine_pf1_2["elapsed"], "\n")
+print(res_fine_pf1_2)
+# Fine PF 1-2 elapsed (s): 442.09
+
+time_fine_pf2_2 <- system.time({
+  res_fine_pf2_2 <- pf_fine(
+    num_particles, sigma_process, sigma_measure,
+    threshold_percentile, num_trials, count2
+  )
+})
+cat("Fine PF 2-2 elapsed (s):", time_fine_pf2_2["elapsed"], "\n")
+print(res_fine_pf2_2)
+# Fine PF 2-2 elapsed (s): 486.82
+
+time_fine_pf3_2 <- system.time({
+  res_fine_pf3_2 <- pf_fine(
+    num_particles, sigma_process, sigma_measure,
+    threshold_percentile, num_trials, count3
+  )
+})
+cat("Fine PF 3-2 elapsed (s):", time_fine_pf3_2["elapsed"], "\n")
+print(res_fine_pf3_2)
+# Fine PF 3-2 elapsed (s): 1131.22 
+
+
+# Fine-grained model 3
+num_particles <- 10500
+sigma_process <- 0.38
+sigma_measure <- 0.93
+threshold_percentile <- 90
+num_trials <- 1000
+
+time_fine_pf1_3 <- system.time({
+  res_fine_pf1_3 <- pf_fine(
+    num_particles, sigma_process, sigma_measure,
+    threshold_percentile, num_trials, count1
+  )
+})
+cat("Fine PF 1-3 elapsed (s):", time_fine_pf1_3["elapsed"], "\n")
+print(res_fine_pf1_3)
+# Fine PF 1-3 elapsed (s): 720.08 
+
+time_fine_pf2_3 <- system.time({
+  res_fine_pf2_3 <- pf_fine(
+    num_particles, sigma_process, sigma_measure,
+    threshold_percentile, num_trials, count2
+  )
+})
+cat("Fine PF 2-3 elapsed (s):", time_fine_pf2_3["elapsed"], "\n")
+print(res_fine_pf2_3)
+# Fine PF 2-3 elapsed (s): 453.63 
+
+time_fine_pf3_3 <- system.time({
+  res_fine_pf3_3 <- pf_fine(
+    num_particles, sigma_process, sigma_measure,
+    threshold_percentile, num_trials, count3
+  )
+})
+cat("Fine PF 3-3 elapsed (s):", time_fine_pf3_3["elapsed"], "\n")
+print(res_fine_pf3_3)
+# Fine PF 3-3 elapsed (s): 900.66 
+
+```
+
+
+
+Conventional model:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(torch)
+library(dplyr)
+
+data <- read.csv("Synthetic_High-Dimensional_Time_Series_Data.csv")
+features <- as.matrix(data[, 1:(ncol(data) - 1)])
+result <- as.numeric(data$Result)
+features <- scale(features)
+features_tensor <- torch_tensor(features, dtype = torch_float())
+result_tensor <- torch_tensor(result, dtype = torch_float())
+
+particle_filter_precision <- function(num_particles, sigma_process, sigma_measure) {
+  n <- length(result)
+  particles <- rnorm(num_particles, mean = result[1], sd = sigma_process)
+  weights <- rep(1 / num_particles, num_particles)
+  anomaly_scores <- numeric(n)
+
+  for (t in 2:n) {
+    particles <- particles + rnorm(num_particles, mean = 0, sd = sigma_process)
+    likelihood <- dnorm(result[t], mean = particles, sd = sigma_measure)
+    weights <- weights * likelihood
+    weights <- weights / sum(weights)
+    estimate <- sum(particles * weights)
+    anomaly_scores[t] <- abs(result[t] - estimate)
+    indices <- sample(1:num_particles, num_particles, replace = TRUE, prob = weights)
+    particles <- particles[indices]
+    weights <- rep(1 / num_particles, num_particles)
+  }
+
+  final_anomalies <- order(anomaly_scores, decreasing = TRUE)[1:10]
+  true_anomalies <- c(8, 92, 122, 127, 130, 149, 150, 159, 164, 196)
+  tp <- sum(final_anomalies %in% true_anomalies)
+  precision <- tp / length(final_anomalies)
+
+  cat("Final Detected Anomalies:", sort(final_anomalies), "\n")
+  cat("Precision =", round(precision, 4), "\n")
+
+  return(round(precision, 4))
+}
+
+# Conventional Model 1
+cat("\n===== Running Particle Filter Model Set 1 =====\n")
+time_pf_set1 <- system.time({
+  res_pf_set1 <- particle_filter_precision(
+    num_particles = 4000,
+    sigma_process = 0.48,
+    sigma_measure = 0.67
+  )
+})
+cat("PF Model Set 1 elapsed (s):", time_pf_set1["elapsed"], "\n")
+print(res_pf_set1)
+# PF Model Set 1 elapsed (s): 0.17
+
+# Conventional Model 2
+cat("\n===== Running Particle Filter Model Set 2 =====\n")
+time_pf_set2 <- system.time({
+  res_pf_set2 <- particle_filter_precision(
+    num_particles = 4500,
+    sigma_process = 0.45,
+    sigma_measure = 0.75
+  )
+})
+cat("PF Model Set 2 elapsed (s):", time_pf_set2["elapsed"], "\n")
+print(res_pf_set2)
+# PF Model Set 2 elapsed (s): 0.17 
+
+# Conventional Model 3
+cat("\n===== Running Particle Filter Model Set 3 =====\n")
+time_pf_set3 <- system.time({
+  res_pf_set3 <- particle_filter_precision(
+    num_particles = 4400,
+    sigma_process = 0.50,
+    sigma_measure = 0.69
+  )
+})
+cat("PF Model Set 3 elapsed (s):", time_pf_set3["elapsed"], "\n")
+print(res_pf_set3)
+# PF Model Set 3 elapsed (s): 0.19 
+```
+
+
+

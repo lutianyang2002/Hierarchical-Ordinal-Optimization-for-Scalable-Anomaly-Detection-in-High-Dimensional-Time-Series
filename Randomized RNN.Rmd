@@ -1,0 +1,514 @@
+---
+title: "Randomized RNN"
+output: html_document
+date: "2025-09-02"
+---
+
+Define the coarse-grained model function: 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(torch)
+library(dplyr)
+
+file_path <- "Synthetic_High-Dimensional_Time_Series_Data.csv"
+time_series_data <- read.csv(file_path)
+
+# Preprocessing
+num_features <- ncol(time_series_data) - 1
+time_series_data[, 1:num_features] <- scale(
+  time_series_data[, 1:num_features],
+  center = TRUE,
+  scale = TRUE
+)
+features <- as.matrix(time_series_data[, 1:num_features])
+result   <- as.numeric(time_series_data$Result)
+features_tensor <- torch_tensor(features, dtype = torch_float())
+result_tensor <- torch_tensor(result,   dtype = torch_float())
+
+# Coarse-grained model function
+rnn_coarse <- function(hidden_size, lr, dropout_rate, epochs, seq_len, batch_size) {
+  count <- rep(0, nrow(features))
+  rrnn_model <- nn_module(
+    "RRNN_Model",
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])  # last time step
+      out <- self$fc(out)
+      out
+    }
+  )
+  for (i in 1:200) {
+    set.seed(i)
+    torch_manual_seed(i)
+    model <- rrnn_model(ncol(features), hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+      loss <- criterion(outputs$squeeze(), result_tensor)
+      loss$backward()
+      optimizer$step()
+    }
+    model$eval()
+    predictions <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+    predictions <- as.numeric(predictions$squeeze())
+    error_scores <- abs(result - predictions)
+    threshold <- quantile(error_scores, 0.95)
+    detected_anomalies <- which(error_scores > threshold)
+    count[detected_anomalies] <- count[detected_anomalies] + 1
+  }
+  top_10_percent <- round(nrow(features) * 0.1)
+  final_anomalies <- order(count, decreasing = TRUE)[1:top_10_percent]
+  return(final_anomalies)
+}
+```
+
+
+Construct coarse-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Ground truth
+true_anomalies <- c(8, 92, 122, 127, 130, 149, 150, 159, 164, 196)
+
+# Compute recall
+compute_recall <- function(detected, truth) {
+  length(intersect(detected, truth)) / length(true_anomalies)
+}
+
+# Coarse-grained model 1
+result1 <- rnn_coarse(hidden_size = 48, lr = 0.020, dropout_rate = 0.26,
+                      epochs = 50, seq_len = 25, batch_size = 200)
+recall1 <- compute_recall(result1, true_anomalies)
+cat("Recall (Model 1):", round(recall1, 4), "\n")
+
+# Coarse-grained model 2
+result2 <- rnn_coarse(hidden_size = 50, lr = 0.022, dropout_rate = 0.25,
+                      epochs = 50, seq_len = 25, batch_size = 200)
+recall2 <- compute_recall(result2, true_anomalies)
+cat("Recall (Model 2):", round(recall2, 4), "\n")
+
+# Coarse-grained model 1
+result3 <- rnn_coarse(hidden_size = 55, lr = 0.018, dropout_rate = 0.25,
+                      epochs = 50, seq_len = 25, batch_size = 200)
+recall3 <- compute_recall(result3, true_anomalies)
+cat("Recall (Model 3):", round(recall3, 4), "\n")
+```
+
+
+Construct fine-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+rnn_fine <- function(hidden_size, lr, dropout_rate, epochs, seq_len, batch_size, count) {
+  count_votes <- rep(0, length(count))  
+  names(count_votes) <- count  
+  rrnn_fine_model <- nn_module(
+    "RRNN_Fine_Model",
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])  # last time step output
+      out <- self$fc(out)
+      out
+    }
+  )
+  num_experiments <- 200
+  for (i in 1:num_experiments) {
+    set.seed(i)          
+    torch_manual_seed(i)  
+    model     <- rrnn_fine_model(ncol(features), hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+      loss    <- criterion(outputs$squeeze(), result_tensor)
+      loss$backward()
+      optimizer$step()
+    }
+    model$eval()
+    predictions  <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+    predictions  <- as.numeric(predictions$squeeze())
+    error_scores <- abs(result - predictions)
+
+    # Only calculate anomaly scores for candidate points
+    fine_anomalies_scores <- error_scores[count]
+
+    threshold <- quantile(fine_anomalies_scores, 0.95)
+    detected_fine_anomalies <- count[fine_anomalies_scores > threshold]
+    count_votes[as.character(detected_fine_anomalies)] <- 
+      count_votes[as.character(detected_fine_anomalies)] + 1
+  }
+
+  final_fine_anomalies <- names(sort(count_votes, decreasing = TRUE))
+  return(final_fine_anomalies[1:10])
+}
+```
+
+
+Define the fine-grained model function:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Fine-grained model 1
+result1_fine1 <- rnn_fine(hidden_size = 120, lr = 0.0015, dropout_rate = 0.03,
+                          epochs = 250, seq_len = 12, batch_size = 64, count = result1)
+result2_fine1 <- rnn_fine(hidden_size = 120, lr = 0.0015, dropout_rate = 0.03,
+                          epochs = 250, seq_len = 12, batch_size = 64, count = result2)
+result3_fine1 <- rnn_fine(hidden_size = 120, lr = 0.0015, dropout_rate = 0.03,
+                          epochs = 250, seq_len = 12, batch_size = 64, count = result3)
+
+# Fine-grained model 2
+result1_fine2 <- rnn_fine(hidden_size = 130, lr = 0.0013, dropout_rate = 0.02,
+                          epochs = 270, seq_len = 8, batch_size = 96, count = result1)
+result2_fine2 <- rnn_fine(hidden_size = 130, lr = 0.0013, dropout_rate = 0.02,
+                          epochs = 270, seq_len = 8, batch_size = 96, count = result2)
+result3_fine2 <- rnn_fine(hidden_size = 130, lr = 0.0013, dropout_rate = 0.02,
+                          epochs = 270, seq_len = 8, batch_size = 96, count = result3)
+
+# Fine-grained model 3
+result1_fine3 <- rnn_fine(hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
+                          epochs = 300, seq_len = 4, batch_size = 128, count = result1)
+result2_fine3 <- rnn_fine(hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
+                          epochs = 300, seq_len = 4, batch_size = 128, count = result2)
+result3_fine3 <- rnn_fine(hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
+                          epochs = 300, seq_len = 4, batch_size = 128, count = result3)
+```
+
+
+Construct fine-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+compute_precision <- function(detected, truth) {
+  length(intersect(detected, truth)) / length(truth)
+}
+
+# Fine-grained model 1
+prec1_fine1 <- compute_precision(result1_fine1, true_anomalies)
+prec2_fine1 <- compute_precision(result2_fine1, true_anomalies)
+prec3_fine1 <- compute_precision(result3_fine1, true_anomalies)
+
+cat("Precision - Fine1:\n")
+cat("  result1_fine1:", round(prec1_fine1, 4), "\n")
+cat("  result2_fine1:", round(prec2_fine1, 4), "\n")
+cat("  result3_fine1:", round(prec3_fine1, 4), "\n\n")
+
+
+# Fine-grained model 2
+prec1_fine2 <- compute_precision(result1_fine2, true_anomalies)
+prec2_fine2 <- compute_precision(result2_fine2, true_anomalies)
+prec3_fine2 <- compute_precision(result3_fine2, true_anomalies)
+
+cat("Precision - Fine2:\n")
+cat("  result1_fine2:", round(prec1_fine2, 4), "\n")
+cat("  result2_fine2:", round(prec2_fine2, 4), "\n")
+cat("  result3_fine2:", round(prec3_fine2, 4), "\n\n")
+
+
+# Fine-grained model 3
+prec1_fine3 <- compute_precision(result1_fine3, true_anomalies)
+prec2_fine3 <- compute_precision(result2_fine3, true_anomalies)
+prec3_fine3 <- compute_precision(result3_fine3, true_anomalies)
+
+cat("Precision - Fine3:\n")
+cat("  result1_fine3:", round(prec1_fine3, 4), "\n")
+cat("  result2_fine3:", round(prec2_fine3, 4), "\n")
+cat("  result3_fine3:", round(prec3_fine3, 4), "\n")
+```
+
+
+Define the function to compute Consistency Probability:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Define the main function
+compute_cp_by_score <- function(score_matrix_A, score_matrix_B) {
+  index_A <- as.numeric(score_matrix_A[1, ])
+  scores_A <- as.numeric(score_matrix_A[2, ])
+  index_B <- as.numeric(score_matrix_B[1, ])
+  scores_B <- as.numeric(score_matrix_B[2, ])
+
+  # Check if indices are identical
+  if (!all(index_A == index_B)) {
+    stop("The first-row indices of the two input matrices are not identical, cannot compare")
+  }
+
+  n <- length(index_A)
+  if (n < 2) stop("Less than 2 points, cannot compute CP value")
+
+  consistent <- 0
+  total_pairs <- 0
+
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      sAi <- as.numeric(scores_A[i])
+      sAj <- as.numeric(scores_A[j])
+      sBi <- as.numeric(scores_B[i]) 
+      sBj <- as.numeric(scores_B[j])
+      if (sAi == 1 && sAj == 1 && sBi == 1 && sBj == 1) {
+        consistent <- consistent + 1
+      } else {
+        sign_A <- sign(sAi - sAj)
+        sign_B <- sign(sBi - sBj)
+        if (sign_A != 0 && sign_B != 0 && sign_A == sign_B) {
+          consistent <- consistent + 1
+        }
+      }
+      total_pairs <- total_pairs + 1
+    }
+  }
+
+  cp <- consistent / total_pairs
+  return(cp * 100)  # percentage
+}
+
+# Compute Anomaly Scores for Coarse-grained Models
+coarse_scoring <- function(features, result, target_indices,
+                           hidden_size = 48, lr = 0.02, dropout_rate = 0.25,
+                           epochs = 50, seq_len = 1, batch_size = 1,
+                           n_trials = 100, verbose = FALSE) {
+  n <- nrow(features)
+  p <- ncol(features)
+  features_tensor <- torch_tensor(as.matrix(features), dtype = torch_float())
+  result_tensor   <- torch_tensor(as.numeric(result), dtype = torch_float())
+  error_matrix <- matrix(0, nrow = n_trials, ncol = length(target_indices))
+  rrnn_model <- nn_module(
+    "RRNN_Model",
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])
+      out <- self$fc(out)
+      out
+    }
+  )
+  for (t in 1:n_trials) {
+    set.seed(t); torch_manual_seed(t)
+    model <- rrnn_model(p, hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+    
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(features_tensor$view(c(n, 1, p)))
+      loss <- criterion(outputs$squeeze(), result_tensor)
+      loss$backward(); optimizer$step()
+    }
+    model$eval()
+    predictions <- model(features_tensor$view(c(n, 1, p)))
+    error_scores <- abs(as.numeric(result) - as.numeric(predictions$squeeze()))
+    error_matrix[t, ] <- error_scores[target_indices]
+    
+    if (verbose && t %% 10 == 0) cat("Trial", t, "completed\n")
+  }
+  avg_error <- colMeans(error_matrix)
+  result_matrix <- rbind(target_indices, avg_error)
+  return(result_matrix)
+}
+
+# Compute Anomaly Scores for Fine-grained Models
+fine_scoring <- function(features, result, coarse_indices, fine_indices,
+                         hidden_size = 48, lr = 0.02, dropout_rate = 0.25,
+                         epochs = 50, seq_len = 1, batch_size = 1,
+                         n_trials = 100, verbose = FALSE) {
+  n <- nrow(features)
+  p <- ncol(features)
+
+  train_idx <- as.integer(coarse_indices)
+  train_idx <- unique(train_idx[is.finite(train_idx) & train_idx >= 1 & train_idx <= n])
+  if (length(train_idx) == 0) stop("coarse_indices is empty after cleaning")
+
+  idx <- as.integer(fine_indices)
+  idx <- unique(idx[is.finite(idx) & idx >= 1 & idx <= n])
+  if (length(idx) == 0) stop("fine_indices is empty after cleaning")
+
+  X_tr  <- torch_tensor(as.matrix(features[train_idx, , drop = FALSE]), dtype = torch_float())
+  y_tr  <- torch_tensor(as.numeric(result[train_idx]), dtype = torch_float())
+  X_all <- torch_tensor(as.matrix(features), dtype = torch_float())
+  y_all <- torch_tensor(as.numeric(result), dtype = torch_float())
+
+  error_matrix <- matrix(NA_real_, nrow = n_trials, ncol = length(idx))
+
+  rrnn_model <- nn_module(
+    "RRNN_Fine_Model",
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])  # last time step
+      out <- self$fc(out)
+      out
+    }
+  )
+
+  for (t in 1:n_trials) {
+    set.seed(t); torch_manual_seed(t)
+
+    model <- rrnn_model(p, hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(X_tr$view(c(length(train_idx), 1, p)))
+      loss <- criterion(outputs$squeeze(), y_tr)
+      loss$backward()
+      optimizer$step()
+    }
+
+    model$eval()
+    preds <- model(X_all$view(c(n, 1, p)))
+    preds_num <- as.numeric(preds$squeeze())
+    err <- abs(as.numeric(result) - preds_num)
+
+    error_matrix[t, ] <- err[idx]
+
+    if (verbose && t %% 10 == 0) cat("Trial", t, "completed\n")
+  }
+  avg_error <- colMeans(error_matrix, na.rm = TRUE)
+
+  result_matrix <- rbind(as.numeric(idx), as.numeric(avg_error))
+  rownames(result_matrix) <- c("index", "avg_error")
+  return(result_matrix)
+}
+
+```
+
+
+Compute Consistency Probability values:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# numerical conversion
+result1_fine1 <- as.numeric(result1_fine1)
+result1_fine2 <- as.numeric(result1_fine2)
+result1_fine3 <- as.numeric(result1_fine3)
+result2_fine1 <- as.numeric(result2_fine1)
+result2_fine2 <- as.numeric(result2_fine2)
+result2_fine3 <- as.numeric(result2_fine3)
+result3_fine1 <- as.numeric(result3_fine1)
+result3_fine2 <- as.numeric(result3_fine2)
+result3_fine3 <- as.numeric(result3_fine3)
+
+# Coarse model scoring
+r1_fine1_coarse <- coarse_scoring(features, result, target_indices = result1_fine1,
+                                  hidden_size = 48, lr = 0.020, dropout_rate = 0.26,
+                                  epochs = 50, seq_len = 25, batch_size = 200, n_trials = 200)
+r1_fine2_coarse <- coarse_scoring(features, result, target_indices = result1_fine2,
+                                  hidden_size = 48, lr = 0.020, dropout_rate = 0.26,
+                                  epochs = 50, seq_len = 25, batch_size = 200, n_trials = 200)
+r1_fine3_coarse <- coarse_scoring(features, result, target_indices = result1_fine3,
+                                  hidden_size = 48, lr = 0.020, dropout_rate = 0.26,
+                                  epochs = 50, seq_len = 25, batch_size = 200, n_trials = 200)
+
+r2_fine1_coarse <- coarse_scoring(features, result, target_indices = result2_fine1,
+                                  hidden_size = 50, lr = 0.022, dropout_rate = 0.25,
+                                  epochs = 50, seq_len = 25, batch_size = 200, n_trials = 200)
+r2_fine2_coarse <- coarse_scoring(features, result, target_indices = result2_fine2,
+                                  hidden_size = 50, lr = 0.022, dropout_rate = 0.25,
+                                  epochs = 50, seq_len = 25, batch_size = 200, n_trials = 200)
+r2_fine3_coarse <- coarse_scoring(features, result, target_indices = result2_fine3,
+                                  hidden_size = 50, lr = 0.022, dropout_rate = 0.25,
+                                  epochs = 50, seq_len = 25, batch_size = 200, n_trials = 200)
+
+r3_fine1_coarse <- coarse_scoring(features, result, target_indices = result3_fine1,
+                                  hidden_size = 55, lr = 0.018, dropout_rate = 0.25,
+                                  epochs = 50, seq_len = 25, batch_size = 200, n_trials = 200)
+r3_fine2_coarse <- coarse_scoring(features, result, target_indices = result3_fine2,
+                                  hidden_size = 55, lr = 0.018, dropout_rate = 0.25,
+                                  epochs = 50, seq_len = 25, batch_size = 200, n_trials = 200)
+r3_fine3_coarse <- coarse_scoring(features, result, target_indices = result3_fine3,
+                                  hidden_size = 55, lr = 0.018, dropout_rate = 0.25,
+                                  epochs = 50, seq_len = 25, batch_size = 200, n_trials = 200)
+
+# Fine model scoring (using coarse model subset for training)
+r1_fine1_fine <- fine_scoring(features, result, coarse_indices = result1, fine_indices = result1_fine1,
+                              hidden_size = 120, lr = 0.0015, dropout_rate = 0.03,
+                              epochs = 250, seq_len = 12, batch_size = 64, n_trials = 200)
+r2_fine1_fine <- fine_scoring(features, result, coarse_indices = result2, fine_indices = result2_fine1,
+                              hidden_size = 120, lr = 0.0015, dropout_rate = 0.03,
+                              epochs = 250, seq_len = 12, batch_size = 64, n_trials = 200)
+r3_fine1_fine <- fine_scoring(features, result, coarse_indices = result3, fine_indices = result3_fine1,
+                              hidden_size = 120, lr = 0.0015, dropout_rate = 0.03,
+                              epochs = 250, seq_len = 12, batch_size = 64, n_trials = 200)
+
+r1_fine2_fine <- fine_scoring(features, result, coarse_indices = result1, fine_indices = result1_fine2,
+                              hidden_size = 130, lr = 0.0013, dropout_rate = 0.02,
+                              epochs = 270, seq_len = 8, batch_size = 96, n_trials = 200)
+r2_fine2_fine <- fine_scoring(features, result, coarse_indices = result2, fine_indices = result2_fine2,
+                              hidden_size = 130, lr = 0.0013, dropout_rate = 0.02,
+                              epochs = 270, seq_len = 8, batch_size = 96, n_trials = 200)
+r3_fine2_fine <- fine_scoring(features, result, coarse_indices = result3, fine_indices = result3_fine2,
+                              hidden_size = 130, lr = 0.0013, dropout_rate = 0.02,
+                              epochs = 270, seq_len = 8, batch_size = 96, n_trials = 200)
+
+r1_fine3_fine <- fine_scoring(features, result, coarse_indices = result1, fine_indices = result1_fine3,
+                              hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
+                              epochs = 300, seq_len = 4, batch_size = 128, n_trials = 200)
+r2_fine3_fine <- fine_scoring(features, result, coarse_indices = result2, fine_indices = result2_fine3,
+                              hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
+                              epochs = 300, seq_len = 4, batch_size = 128, n_trials = 200)
+r3_fine3_fine <- fine_scoring(features, result, coarse_indices = result3, fine_indices = result3_fine3,
+                              hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
+                              epochs = 300, seq_len = 4, batch_size = 128, n_trials = 100)
+
+# CP value computation
+cp_r1_f1 <- compute_cp_by_score(r1_fine1_coarse, r1_fine1_fine)
+cp_r2_f1 <- compute_cp_by_score(r2_fine1_coarse, r2_fine1_fine)
+cp_r3_f1 <- compute_cp_by_score(r3_fine1_coarse, r3_fine1_fine)
+
+cp_r1_f2 <- compute_cp_by_score(r1_fine2_coarse, r1_fine2_fine)
+cp_r2_f2 <- compute_cp_by_score(r2_fine2_coarse, r2_fine2_fine)
+cp_r3_f2 <- compute_cp_by_score(r3_fine2_coarse, r3_fine2_fine)
+
+cp_r1_f3 <- compute_cp_by_score(r1_fine3_coarse, r1_fine3_fine)
+cp_r2_f3 <- compute_cp_by_score(r2_fine3_coarse, r2_fine3_fine)
+cp_r3_f3 <- compute_cp_by_score(r3_fine3_coarse, r3_fine3_fine)
+
+# Output results
+cat("CP(result1, fine1):", round(cp_r1_f1, 4), "%\n")
+cat("CP(result2, fine1):", round(cp_r2_f1, 4), "%\n")
+cat("CP(result3, fine1):", round(cp_r3_f1, 4), "%\n\n")
+
+cat("CP(result1, fine2):", round(cp_r1_f2, 4), "%\n")
+cat("CP(result2, fine2):", round(cp_r2_f2, 4), "%\n")
+cat("CP(result3, fine2):", round(cp_r3_f2, 4), "%\n\n")
+
+cat("CP(result1, fine3):", round(cp_r1_f3, 4), "%\n")
+cat("CP(result2, fine3):", round(cp_r2_f3, 4), "%\n")
+cat("CP(result3, fine3):", round(cp_r3_f3, 4), "%\n")
+```
+
+
+Visualization:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+detected_all <- sort(unique(c(
+  intersect(as.integer(result1_fine1), true_anomalies),
+  intersect(as.integer(result1_fine2), true_anomalies),
+  intersect(as.integer(result1_fine3), true_anomalies),
+  intersect(as.integer(result2_fine1), true_anomalies),
+  intersect(as.integer(result2_fine2), true_anomalies),
+  intersect(as.integer(result2_fine3), true_anomalies),
+  intersect(as.integer(result3_fine1), true_anomalies),
+  intersect(as.integer(result3_fine2), true_anomalies),
+  intersect(as.integer(result3_fine3), true_anomalies)
+)))
+missed_true <- setdiff(true_anomalies, detected_all)
+
+time_idx <- seq_along(result)
+plot(time_idx, result, type = "l", lwd = 1.3,
+     xlab = "Time Step", ylab = "Result Value",
+     main = "Time Series with Detected True Anomalies")
+if (length(detected_all)) points(detected_all, result[detected_all], pch = 19, cex = 0.9, col = "blue")
+if (length(missed_true)) points(missed_true, result[missed_true], pch = 19, cex = 0.9, col = "red")
+```

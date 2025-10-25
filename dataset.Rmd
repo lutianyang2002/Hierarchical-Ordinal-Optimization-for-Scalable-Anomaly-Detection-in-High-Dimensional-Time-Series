@@ -1,0 +1,38 @@
+---
+title: "dataset"
+output: html_document
+date: "2025-09-03"
+---
+
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(dplyr)
+set.seed(123)
+num_samples <- 200   
+num_features <- 100
+num_anomalies <- 10  
+features <- matrix(rnorm(num_samples * num_features, mean = 0, sd = 1), 
+                   nrow = num_samples, ncol = num_features)
+result <- runif(num_samples, min = -10, max = 10)  
+
+# Select 10 anomaly indices
+anomaly_indices <- sample(1:num_samples, num_anomalies, replace = FALSE)
+
+# Introduce anomalies
+for (idx in anomaly_indices) {
+  anomaly_features <- sample(1:num_features, size = sample(5:15, 1), replace = FALSE)  # 5–15 features are modified
+  features[idx, anomaly_features] <- features[idx, anomaly_features] + 
+    rnorm(length(anomaly_features), mean = 15, sd = 5)
+  result[idx] <- result[idx] + rnorm(1, mean = 10, sd = 2)  # adjust result value
+}
+
+# Create data frame 
+data <- as.data.frame(features)
+data$Result <- result  # add result column
+
+# Save dataset to CSV in the current working directory
+write.csv(data, "Synthetic_High-Dimensional_Time_Series_Data.csv", row.names = FALSE)
+
+# Output anomaly indices
+print(sort(anomaly_indices))
+```
+
