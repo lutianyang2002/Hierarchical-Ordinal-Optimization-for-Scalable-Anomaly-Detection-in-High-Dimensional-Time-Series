@@ -1,7 +1,6 @@
 ---
 title: "particle"
 output: html_document
-date: "2025-09-03"
 ---
 
 Define the coarse-grained model function: 
@@ -430,4 +429,5 @@ if (length(detected_all))
 if (length(missed_true)) 
   points(missed_true, result[missed_true], pch = 19, cex = 0.9, col = "red")
 ```
+
 
