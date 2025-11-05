@@ -181,7 +181,7 @@ result3_fine3 <- rnn_fine(hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
 ```
 
 
-Construct fine-grained models:
+Calculate precisions:
 ```{r, echo=TRUE, warning=FALSE, message=FALSE}
 compute_precision <- function(detected, truth) {
   length(intersect(detected, truth)) / length(truth)
@@ -511,4 +511,5 @@ plot(time_idx, result, type = "l", lwd = 1.3,
 if (length(detected_all)) points(detected_all, result[detected_all], pch = 19, cex = 0.9, col = "blue")
 if (length(missed_true)) points(missed_true, result[missed_true], pch = 19, cex = 0.9, col = "red")
 ```
+
 
