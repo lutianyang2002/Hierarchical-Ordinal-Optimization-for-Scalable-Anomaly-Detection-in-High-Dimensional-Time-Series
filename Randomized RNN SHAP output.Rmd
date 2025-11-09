@@ -1,0 +1,220 @@
+---
+title: "Randomized RNN"
+output: html_document
+date: "2025-09-02"
+---
+
+Define the coarse-grained model function: 
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+library(torch)
+library(dplyr)
+
+file_path <- "Synthetic_High-Dimensional_Time_Series_Data.csv"
+time_series_data <- read.csv(file_path)
+
+# Preprocessing
+num_features <- ncol(time_series_data) - 1
+time_series_data[, 1:num_features] <- scale(
+  time_series_data[, 1:num_features],
+  center = TRUE,
+  scale = TRUE
+)
+features <- as.matrix(time_series_data[, 1:num_features])
+result   <- as.numeric(time_series_data$Result)
+features_tensor <- torch_tensor(features, dtype = torch_float())
+result_tensor <- torch_tensor(result,   dtype = torch_float())
+
+# Coarse-grained model function
+rnn_coarse <- function(hidden_size, lr, dropout_rate, epochs, seq_len, batch_size) {
+  count <- rep(0, nrow(features))
+  rrnn_model <- nn_module(
+    "RRNN_Model",
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])  # last time step
+      out <- self$fc(out)
+      out
+    }
+  )
+  for (i in 1:200) {
+    set.seed(i)
+    torch_manual_seed(i)
+    model <- rrnn_model(ncol(features), hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+      loss <- criterion(outputs$squeeze(), result_tensor)
+      loss$backward()
+      optimizer$step()
+    }
+    model$eval()
+    predictions <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+    predictions <- as.numeric(predictions$squeeze())
+    error_scores <- abs(result - predictions)
+    threshold <- quantile(error_scores, 0.95)
+    detected_anomalies <- which(error_scores > threshold)
+    count[detected_anomalies] <- count[detected_anomalies] + 1
+  }
+  top_10_percent <- round(nrow(features) * 0.1)
+  final_anomalies <- order(count, decreasing = TRUE)[1:top_10_percent]
+  return(final_anomalies)
+}
+```
+
+
+Construct coarse-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Ground truth
+true_anomalies <- c(8, 92, 122, 127, 130, 149, 150, 159, 164, 196)
+
+# Compute recall
+compute_recall <- function(detected, truth) {
+  length(intersect(detected, truth)) / length(true_anomalies)
+}
+
+# Coarse-grained model 1
+result1 <- rnn_coarse(hidden_size = 48, lr = 0.020, dropout_rate = 0.26,
+                      epochs = 50, seq_len = 25, batch_size = 200)
+recall1 <- compute_recall(result1, true_anomalies)
+cat("Recall (Model 1):", round(recall1, 4), "\n")
+
+# Coarse-grained model 2
+result2 <- rnn_coarse(hidden_size = 50, lr = 0.022, dropout_rate = 0.25,
+                      epochs = 50, seq_len = 25, batch_size = 200)
+recall2 <- compute_recall(result2, true_anomalies)
+cat("Recall (Model 2):", round(recall2, 4), "\n")
+
+# Coarse-grained model 1
+result3 <- rnn_coarse(hidden_size = 55, lr = 0.018, dropout_rate = 0.25,
+                      epochs = 50, seq_len = 25, batch_size = 200)
+recall3 <- compute_recall(result3, true_anomalies)
+cat("Recall (Model 3):", round(recall3, 4), "\n")
+```
+
+
+Save the potential anomalies output from the coarse-grained model:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+save_coarse_outputs <- function(result_list, file_prefix) {
+  for (i in seq_along(result_list)) {
+    result_idx <- result_list[[i]]
+    subset_df <- time_series_data[result_idx, ]
+    subset_df$Index <- result_idx 
+    subset_df <- subset_df[, c("Index", colnames(time_series_data))]
+    write.csv(subset_df,
+              paste0(file_prefix, i, "_output.csv"),
+              row.names = FALSE)
+  }
+}
+
+save_coarse_outputs(list(result1, result2, result3), "result")
+```
+
+
+Construct fine-grained models:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+rnn_fine_output <- function(hidden_size, lr, dropout_rate, epochs, seq_len, batch_size, count, output_file) {
+  rrnn_fine_model <- nn_module(
+    "RRNN_Fine_Model",
+    initialize = function(input_size, hidden_size, output_size) {
+      self$rnn <- nn_rnn(input_size = input_size, hidden_size = hidden_size, batch_first = TRUE)
+      self$dropout <- nn_dropout(p = dropout_rate)
+      self$fc <- nn_linear(hidden_size, output_size)
+    },
+    forward = function(x) {
+      out <- self$rnn(x)
+      out <- self$dropout(out[[1]][, -1, ])
+      out <- self$fc(out)
+      out
+    }
+  )
+
+  num_experiments <- 200
+  anomaly_scores_avg <- rep(0, length(count))
+
+  for (i in 1:num_experiments) {
+    set.seed(i)
+    torch_manual_seed(i)
+    model     <- rrnn_fine_model(ncol(features), hidden_size, 1)
+    optimizer <- optim_adam(model$parameters, lr = lr)
+    criterion <- nn_mse_loss()
+
+    for (epoch in 1:epochs) {
+      model$train()
+      optimizer$zero_grad()
+      outputs <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+      loss <- criterion(outputs$squeeze(), result_tensor)
+      loss$backward()
+      optimizer$step()
+    }
+
+    model$eval()
+    predictions <- model(features_tensor$view(c(nrow(features), 1, ncol(features))))
+    predictions <- as.numeric(predictions$squeeze())
+    error_scores <- abs(result - predictions)
+    anomaly_scores_avg <- anomaly_scores_avg + error_scores[count]
+  }
+
+  # Calculate anomaly scores
+  anomaly_scores_avg <- anomaly_scores_avg / num_experiments
+  fine_output <- data.frame(
+    Index = count,
+    Anomaly_Score = anomaly_scores_avg
+  )
+
+  write.csv(fine_output, output_file, row.names = FALSE)
+}
+```
+
+
+Define the fine-grained model function and save outputs:
+```{r, echo=TRUE, warning=FALSE, message=FALSE}
+# Fine-grained model 1
+rnn_fine_output(hidden_size = 120, lr = 0.0015, dropout_rate = 0.03,
+                epochs = 250, seq_len = 12, batch_size = 64,
+                count = result1, output_file = "result1_fine1_anomaly_scores.csv")
+
+rnn_fine_output(hidden_size = 120, lr = 0.0015, dropout_rate = 0.03,
+                epochs = 250, seq_len = 12, batch_size = 64,
+                count = result2, output_file = "result2_fine1_anomaly_scores.csv")
+
+rnn_fine_output(hidden_size = 120, lr = 0.0015, dropout_rate = 0.03,
+                epochs = 250, seq_len = 12, batch_size = 64,
+                count = result3, output_file = "result3_fine1_anomaly_scores.csv")
+
+
+# Fine-grained model 2
+rnn_fine_output(hidden_size = 130, lr = 0.0013, dropout_rate = 0.02,
+                epochs = 270, seq_len = 8, batch_size = 96,
+                count = result1, output_file = "result1_fine2_anomaly_scores.csv")
+
+rnn_fine_output(hidden_size = 130, lr = 0.0013, dropout_rate = 0.02,
+                epochs = 270, seq_len = 8, batch_size = 96,
+                count = result2, output_file = "result2_fine2_anomaly_scores.csv")
+
+rnn_fine_output(hidden_size = 130, lr = 0.0013, dropout_rate = 0.02,
+                epochs = 270, seq_len = 8, batch_size = 96,
+                count = result3, output_file = "result3_fine2_anomaly_scores.csv")
+
+
+# Fine-grained model 3
+rnn_fine_output(hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
+                epochs = 300, seq_len = 4, batch_size = 128,
+                count = result1, output_file = "result1_fine3_anomaly_scores.csv")
+
+rnn_fine_output(hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
+                epochs = 300, seq_len = 4, batch_size = 128,
+                count = result2, output_file = "result2_fine3_anomaly_scores.csv")
+
+rnn_fine_output(hidden_size = 140, lr = 0.0012, dropout_rate = 0.01,
+                epochs = 300, seq_len = 4, batch_size = 128,
+                count = result3, output_file = "result3_fine3_anomaly_scores.csv")
+```
+
